@@ -1,0 +1,40 @@
+[package]
+name = "liana"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "liana"
+path = "src/main.rs"
+
+# Optional: Keep this if you still want to expose things to Python or share code across tests
+[lib]
+name = "liana"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# --- Core Rust ML & Math ---
+candle-core = "0.8.0"
+candle-nn = "0.8.0"
+safetensors = "0.4.1"
+
+# --- Python Interop (Leave if you want PyO3, remove if pure Rust) ---
+pyo3 = { version = "0.20", features = ["extension-module"] }
+numpy = "0.20"
+
+# --- Arrays & Math ---
+ndarray = { version = "0.15", features = ["rayon"] }
+rayon = "1.8"
+realfft = "3.3"
+rustfft = "6.1"
+num-complex = "0.4"
+rand = "0.8"
+rand_distr = "0.4"
+
+# --- Utilities & IO ---
+anyhow = "1.0"
+flate2 = "1.0"
+itertools = "0.12.0"
+clap = { version = "4.4", features = ["derive"] }
+noodles = { version = "0.74.0", features = ["vcf", "bgzf"] }
