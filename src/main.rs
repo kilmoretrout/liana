@@ -1,252 +1,257 @@
-use clap::Parser;
-use std::path::PathBuf;
+use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufReader, Write, BufRead};
-
-use candle_core::{Device, DType, Tensor};
-use candle_nn::VarBuilder;
-use ndarray::{Array1, Array2};
-
-use liana::layers::ConvGCNUNet;
-use liana::regressors::UNetRegressor;
-use liana::RealWavelet;
-use noodles::vcf;
-
+use std::io::{BufRead, BufWriter, Write};
+use memmap2::MmapOptions;
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the input VCF file (uncompressed or bgzipped)
     #[arg(short, long)]
-    input: PathBuf,
-
-    /// Path to output the tree sequence (.trees)
+    vcf: String,
+    
     #[arg(short, long)]
-    output: PathBuf,
+    bin: String,
+    
+    #[arg(short, long, default_value = "tree_sequence_regions.tsv")]
+    output: String,
 
-    /// Path to the model weights (.safetensors)
-    #[arg(short, long)]
-    model_weights: PathBuf,
-
-    /// Enable CUDA acceleration
-    #[arg(long, default_value_t = false)]
-    cuda: bool,
+    #[arg(short, long, default_value_t = 32)]
+    target_ind: usize,
 }
 
+#[inline]
+fn get_idx(n: usize, i: usize, j: usize) -> usize {
+    let (a, b) = if i < j { (i, j) } else { (j, i) };
+    (n * a) - (a * (a + 1) / 2) + b - a - 1
+}
 
-// (Assuming your other imports are here)
+#[derive(Clone, Debug)]
+pub struct Tree {
+    pub topology_hash: String,
+    pub merges: Vec<(usize, usize)>,
+    pub node_times: Vec<f32>,
+}
+
+pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
+    let mut dist = vec![vec![0.0; n * 2]; n * 2];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = condensed_dist[get_idx(n, i, j)];
+            dist[i][j] = d;
+            dist[j][i] = d;
+        }
+    }
+
+    let mut active = vec![true; n * 2];
+    let mut cluster_size = vec![1.0; n * 2];
+    let mut topologies = vec![String::new(); n * 2];
+    
+    let mut merges = Vec::with_capacity(n - 1);
+    let mut node_times = Vec::with_capacity(n - 1);
+    
+    for i in 0..n {
+        topologies[i] = i.to_string();
+    }
+
+    let mut next_node = n;
+
+    for _ in 0..(n - 1) {
+        let mut min_d = f32::MAX;
+        let mut min_i = 0;
+        let mut min_j = 0;
+
+        for i in 0..next_node {
+            if !active[i] { continue; }
+            for j in (i + 1)..next_node {
+                if !active[j] { continue; }
+                if dist[i][j] < min_d {
+                    min_d = dist[i][j];
+                    min_i = i;
+                    min_j = j;
+                }
+            }
+        }
+
+        active[min_i] = false;
+        active[min_j] = false;
+        active[next_node] = true;
+
+        node_times.push(min_d / 2.0);
+
+        // Sorting the string representations creates a canonical topology hash
+        // guaranteeing that ((0,1),2) and (2,(1,0)) map to the exact same string
+        let mut children = [topologies[min_i].clone(), topologies[min_j].clone()];
+        children.sort(); 
+        topologies[next_node] = format!("({},{})", children[0], children[1]);
+
+        // Keep merge tuples sorted identically for Newick generation later
+        if topologies[min_i] < topologies[min_j] {
+            merges.push((min_i, min_j));
+        } else {
+            merges.push((min_j, min_i));
+        }
+
+        let size_i = cluster_size[min_i];
+        let size_j = cluster_size[min_j];
+        cluster_size[next_node] = size_i + size_j;
+
+        for k in 0..next_node {
+            if active[k] {
+                let d = (size_i * dist[min_i][k] + size_j * dist[min_j][k]) / (size_i + size_j);
+                dist[next_node][k] = d;
+                dist[k][next_node] = d;
+            }
+        }
+        next_node += 1;
+    }
+
+    Tree {
+        topology_hash: topologies[next_node - 1].clone(),
+        merges,
+        node_times,
+    }
+}
+
+// Reconstructs a standard Newick string using the AVERAGED coalescent times
+fn build_newick(n: usize, merges: &[(usize, usize)], node_times: &[f32]) -> String {
+    let mut heights = vec![0.0; n * 2];
+    let mut strings = vec![String::new(); n * 2];
+    
+    for i in 0..n {
+        strings[i] = i.to_string();
+    }
+    
+    for i in 0..(n - 1) {
+        let parent = n + i;
+        heights[parent] = node_times[i];
+        
+        let (c1, c2) = merges[i];
+        
+        let bl1 = (heights[parent] - heights[c1]).max(0.0);
+        let bl2 = (heights[parent] - heights[c2]).max(0.0);
+        
+        strings[parent] = format!("({}:{},{}:{})", strings[c1], bl1, strings[c2], bl2);
+    }
+    
+    format!("{};", strings[(n * 2) - 2])
+}
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let n = args.target_ind;
 
-    // 1. Setup Device
-    let device = if args.cuda {
-        Device::new_cuda(0).unwrap_or_else(|_| {
-            eprintln!("Warning: CUDA requested but not found. Falling back to CPU.");
-            Device::Cpu
-        })
-    } else {
-        Device::Cpu
-    };
-    println!("Using device: {:?}", device);
-
-    // ---------------------------------------------------------
-    // 2. Parse VCF into NDArray
-    // ---------------------------------------------------------
-    println!("Parsing VCF: {:?}", args.input);
-    
-    let file = File::open(&args.input)?;
-    let mut reader = noodles::bgzf::Reader::new(file);
-    
+    // 1. Extract exactly the positions that the model predicted on
+    println!("Extracting positions from VCF (filtering to {} individuals)...", n);
+    let vcf_file = File::open(&args.vcf)?;
+    let mut reader = noodles::bgzf::Reader::new(vcf_file);
     let mut line = String::new();
-    let mut n_individuals = 0;
-    let mut total_base_pairs = 0.0f32;
     
-    // 1. Read header to get the number of individuals AND contig length
-    while reader.read_line(&mut line)? > 0 {
-        // Try to grab the exact chromosome length if the VCF header provides it
-        if line.starts_with("##contig=") && line.contains("length=") {
-            if let Some(start_idx) = line.find("length=") {
-                let tail = &line[start_idx + 7..];
-                let end_idx = tail.find(['>', ',']).unwrap_or(tail.len());
-                if let Ok(l) = tail[..end_idx].parse::<f32>() {
-                    total_base_pairs = total_base_pairs.max(l);
-                }
-            }
-        } else if line.starts_with("#CHROM") {
-            let cols: Vec<&str> = line.trim_end().split('\t').collect();
-            // Genotypes start at column 9 (0-indexed)
-            n_individuals = cols.len().saturating_sub(9);
-            line.clear();
-            break;
-        }
-        line.clear();
-    }
-
     let mut pos_vec = Vec::new();
-    let mut genotype_matrix = Vec::new(); 
 
-    // 2. Parse variants
     while reader.read_line(&mut line)? > 0 {
-        if line.starts_with('#') { 
-            line.clear(); 
-            continue; 
-        }
+        if line.starts_with('#') { line.clear(); continue; }
         
         let cols: Vec<&str> = line.trim_end().split('\t').collect();
-        if cols.len() < 9 { 
-            line.clear(); 
-            continue; 
-        }
+        if cols.len() < 9 + n { line.clear(); continue; }
         
-        // Extract Position (Column 1 is POS)
-        let pos: f32 = cols[1].parse().expect("Failed to parse position");
-        pos_vec.push(pos);
-
-        // Extract Genotypes (Columns 9 to End)
-        for i in 9..cols.len() {
-            let gt_str = cols[i].split(':').next().unwrap_or("0");
+        let pos: f32 = cols[1].parse()?;
+        
+        // Emulate Python's `if not np.all(row_arr == row_arr[0]):`
+        let mut first_val = -1.0;
+        let mut is_uniform = true;
+        
+        for i in 9..(9 + n) {
+            let gt_base = cols[i].split(':').next().unwrap_or("0");
+            let val = if gt_base.contains('.') { 0.5 } else if gt_base.contains('1') { 1.0 } else { 0.0 };
             
-            // Check for missing data first
-            let allele = if gt_str.contains('.') {
-                0.5f32
-            } else if gt_str.contains('1') { 
-                1.0f32 
-            } else { 
-                0.0f32 
-            };
-            genotype_matrix.push(allele);
+            if i == 9 {
+                first_val = val;
+            } else if val != first_val {
+                is_uniform = false;
+                break; // Short circuit as soon as variation is found
+            }
         }
         
+        if !is_uniform {
+            pos_vec.push(pos);
+        }
         line.clear();
     }
-
+    
     let sequence_length = pos_vec.len();
-    
-    // Fallback: If the VCF header lacked the contig length, use the position of the last SNP.
-    if let Some(&last_snp_pos) = pos_vec.last() {
-        total_base_pairs = total_base_pairs.max(last_snp_pos);
-    }
-    
-    println!(
-        "Parsed {} variants spanning {:.2} Megabases for {} individuals.", 
-        sequence_length, 
-        total_base_pairs / 1_000_000.0, 
-        n_individuals
-    );
+    let num_pairs = (n * (n - 1)) / 2;
+    println!("Found {} polymorphic sites.", sequence_length);
 
-    // Reshape the flat vector into an (N, L) matrix
-    let x_ndarray = Array2::from_shape_vec((n_individuals, sequence_length), genotype_matrix)?;
-    let pos_ndarray = Array1::from_vec(pos_vec);
-
-    // ---------------------------------------------------------
-    // 2.5 Downsample & Filter Uniform Sites
-    // ---------------------------------------------------------
-    // ---------------------------------------------------------
-    // 2.5 Downsample & Filter Uniform Sites
-    // ---------------------------------------------------------
-    println!("Downsampling to 32 individuals and removing uniform sites...");
-    use ndarray::s;
+    // 2. Memory-map the Binary file
+    println!("Memory-mapping {}...", args.bin);
+    let bin_file = File::open(&args.bin)?;
+    let mmap = unsafe { MmapOptions::new().map(&bin_file)? };
     
-    let target_individuals = 32.min(n_individuals);
-    let mut filtered_x = Vec::new();
-    let mut filtered_pos = Vec::new();
+    let f32_slice = unsafe {
+        std::slice::from_raw_parts(
+            mmap.as_ptr() as *const f32, 
+            mmap.len() / std::mem::size_of::<f32>()
+        )
+    };
+    
+    assert_eq!(f32_slice.len(), sequence_length * num_pairs, "Mismatch between VCF and BIN lengths!");
 
-    for j in 0..sequence_length {
-        // Look at the j-th SNP for only the first 32 individuals
-        let column = x_ndarray.slice(s![0..target_individuals, j]);
-        
-        // A site is uniform if every individual has the exact same value.
-        let first_val = column[0];
-        let is_uniform = column.iter().all(|&val| val == first_val);
-        
-        // Keep the site only if it has variation
-        if !is_uniform {
-            filtered_pos.push(pos_ndarray[j]);
-            filtered_x.extend(column.iter());
+    // 3. Parallel UPGMA Construction
+    println!("Spawning UPGMA tasks across all CPU threads...");
+    let trees: Vec<Tree> = (0..sequence_length)
+        .into_par_iter()
+        .map(|w| {
+            let dists = &f32_slice[w * num_pairs .. (w + 1) * num_pairs];
+            run_upgma(dists, n)
+        })
+        .collect();
+
+    // 4. Collapse Regions and Write TSV
+    println!("Collapsing identical topologies and writing TSV...");
+    let out_file = File::create(&args.output)?;
+    let mut writer = BufWriter::new(out_file);
+    writeln!(writer, "Start_BP\tEnd_BP\tNewick")?;
+
+    let mut current_topology = trees[0].topology_hash.clone();
+    let mut current_merges = trees[0].merges.clone();
+    let mut current_times = trees[0].node_times.clone();
+    let mut start_idx = 0;
+    let mut count = 1.0;
+
+    let mut num_regions = 0;
+
+    for i in 1..sequence_length {
+        if trees[i].topology_hash == current_topology {
+            for (acc, t) in current_times.iter_mut().zip(&trees[i].node_times) {
+                *acc += t;
+            }
+            count += 1.0;
+        } else {
+            // Region boundary! Average times and write Newick
+            for acc in current_times.iter_mut() { *acc /= count; }
+            
+            let newick = build_newick(n, &current_merges, &current_times);
+            writeln!(writer, "{:.0}\t{:.0}\t{}", pos_vec[start_idx], pos_vec[i], newick)?;
+            num_regions += 1;
+
+            // Reset
+            current_topology = trees[i].topology_hash.clone();
+            current_merges = trees[i].merges.clone();
+            current_times = trees[i].node_times.clone();
+            start_idx = i;
+            count = 1.0;
         }
     }
 
-    let new_sequence_length = filtered_pos.len();
+    // Write final region
+    for acc in current_times.iter_mut() { *acc /= count; }
+    let newick = build_newick(n, &current_merges, &current_times);
+    writeln!(writer, "{:.0}\t{:.0}\t{}", pos_vec[start_idx], pos_vec[sequence_length - 1], newick)?;
+    num_regions += 1;
     
-    // Replace the old arrays with the new downsampled ones
-    let x_ndarray = Array2::from_shape_vec((target_individuals, new_sequence_length), filtered_x)?;
-    let pos_ndarray = Array1::from_vec(filtered_pos);
-    
-    // Update n_individuals and sequence_length variables for the rest of the script
-    let n_individuals = target_individuals;
-    let sequence_length = new_sequence_length;
-
-    println!(
-        "After filtering, kept {} polymorphic variants across {} individuals.", 
-        sequence_length, n_individuals
-    );
-    
-    // Update n_individuals and sequence_length variables for the rest of the script
-    let n_individuals = target_individuals;
-    let sequence_length = new_sequence_length;
-
-    println!(
-        "After filtering, kept {} polymorphic variants across {} individuals.", 
-        sequence_length, n_individuals
-    );
-
-    // ---------------------------------------------------------
-    // 3. Load Neural Network Weights
-    // ---------------------------------------------------------
-    println!("Loading model weights from {:?}", args.model_weights);
-    let vb = unsafe { 
-        VarBuilder::from_mmaped_safetensors(&[&args.model_weights], DType::F32, &device)? 
-    };
-
-    let in_dim = 101;
-    let embedding_dim = 32;
-    let gcn_dims = vec![512, 256, 128, 64];
-    let k = 11;
-    
-    let model = ConvGCNUNet::new(
-        in_dim, &gcn_dims, k, embedding_dim, false, "lorentz".to_string(), vb
-    )?;
-
-    // NOTE: In production, you'd load mu_x, std_x, mu_y, std_y from a safetensors config.
-    let scales: Vec<f32> = (1..100).map(|x| x as f32).collect(); 
-    let mu_x = Tensor::zeros(99, DType::F32, &device)?;
-    let std_x = Tensor::ones(99, DType::F32, &device)?;
-
-    let regressor = UNetRegressor::new(
-        model, 
-        scales, 
-        RealWavelet::Shannon, 
-        mu_x, std_x, 
-        0.0, 1.0, 
-        1024,     
-        512,      
-        device
-    );
-
-    // ---------------------------------------------------------
-    // 4. Run Inference
-    // ---------------------------------------------------------
-    println!("Running inference (Continuous Wavelets + UNet)...");
-    
-
-    let temp_bin_path = "predictions_output.bin";
-    
-    regressor.predict_to_disk(
-        &x_ndarray, 
-        &pos_ndarray, 
-        None, 
-        total_base_pairs,  // <--- Pass the parsed variable here!
-        temp_bin_path
-    )?;
-    
-    println!("Successfully generated and streamed coalescent distances to: {}", temp_bin_path);
-
-    // ---------------------------------------------------------
-    // 5. Build Tree Sequence
-    // ---------------------------------------------------------
-    println!("Writing Tree Sequence to {:?}", args.output);
-    // TODO: Memory-map `temp_bin_path` and run UPGMA/NJ clustering here.
+    writer.flush()?;
+    println!("Done! Generated contiguous tree sequence with {} regions.", num_regions);
 
     Ok(())
 }
