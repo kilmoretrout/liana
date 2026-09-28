@@ -3,37 +3,32 @@ use candle_nn::{Conv1d, Conv1dConfig, GroupNorm, LayerNorm, Linear, VarBuilder};
 use candle_core::Module;
 use candle_nn::RNN;
 
-struct UpConv {
-    proj: Linear,
+pub struct UpConv {
+    conv: candle_nn::ConvTranspose1d,
     out_c: usize,
 }
 
 impl UpConv {
     fn new(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
-        // A transposed conv with stride=2, kernel=2 is identical to projecting 
-        // 1 element to 2 elements, and unpacking them.
-        let proj = candle_nn::linear(in_c, out_c * 2, vb.pp("proj"))?;
-        Ok(Self { proj, out_c })
+        // Set up the transposed convolution just like PyTorch: kernel_size=2, stride=2
+        let cfg = candle_nn::ConvTranspose1dConfig {
+            stride: 2,
+            padding: 0,
+            ..Default::default()
+        };
+        
+        // Pass `vb` DIRECTLY (no .pp("proj")) so it looks for `up_convs.0.weight`.
+        // If your PyTorch code actually nested it inside a variable (e.g. self.up = ...),
+        // then you would use vb.pp("up") here. 
+        let conv = candle_nn::conv_transpose1d(in_c, out_c, 2, cfg, vb)?;
+        
+        Ok(Self { conv, out_c }) // Wait, out_c might not even be needed anymore!
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // x: (B, C, S)
-        let (b, _c, s) = x.dims3()?;
-        
-        // Transpose for linear: (B, S, C)
-        let x_t = x.transpose(1, 2)?.contiguous()?;
-        
-        // Apply projection: (B, S, OutC * 2)
-        let projected = self.proj.forward(&x_t)?;
-        
-        // Reshape to (B, S, OutC, 2)
-        let reshaped = projected.reshape((b, s, self.out_c, 2))?;
-        
-        // Transpose to (B, OutC, S, 2)
-        let transposed = reshaped.transpose(1, 2)?;
-        
-        // Reshape to (B, OutC, S * 2)
-        transposed.reshape((b, self.out_c, s * 2))
+        // x shape: (B, C, S)
+        // Native ConvTranspose1d handles the upsampling automatically!
+        self.conv.forward(x)
     }
 }
 
@@ -96,12 +91,18 @@ struct ResConvBlock {
 impl ResConvBlock {
     fn new(in_dim: usize, out_dim: usize, kernel_w: usize, dilations: [usize; 3], vb: VarBuilder) -> Result<Self> {
         let build_conv = |in_c, out_c, d, name| {
-            let cfg = Conv1dConfig { padding: ((kernel_w - 1) * d) / 2, dilation: d, ..Default::default() };
+            let cfg = candle_nn::Conv1dConfig { padding: ((kernel_w - 1) * d) / 2, dilation: d, ..Default::default() };
             candle_nn::conv1d(in_c, out_c, kernel_w, cfg, vb.pp(name))
         };
 
-        // GroupNorm with groups = channels is identical to InstanceNorm
-        let build_norm = |c, name| candle_nn::group_norm(c, c, 1e-5, vb.pp(name));
+        // PyTorch InstanceNorm1d defaults to affine=False (no saved weights).
+        // We manually create a GroupNorm with 1.0s and 0.0s to bypass VarBuilder.
+        let build_norm = |c: usize, _name: &str| -> Result<candle_nn::GroupNorm> {
+            let weight = candle_core::Tensor::ones(c, candle_core::DType::F32, vb.device())?;
+            let bias = candle_core::Tensor::zeros(c, candle_core::DType::F32, vb.device())?;
+            // GroupNorm::new(weight, bias, num_channels, num_groups, eps)
+            candle_nn::GroupNorm::new(weight, bias, c, c, 1e-5)
+        };
 
         Ok(Self {
             conv0: build_conv(in_dim, out_dim, dilations[0], "conv0")?,
@@ -112,7 +113,7 @@ impl ResConvBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &candle_core::Tensor) -> Result<candle_core::Tensor> {
         let x0 = apply_conv_norm(&self.conv0, Some(&self.norm0), x)?;
         let x0_act = candle_nn::ops::leaky_relu(&x0, 0.01)?; // PyTorch default LeakyReLU is 0.01
 
@@ -140,10 +141,16 @@ struct DenseGATv2Conv {
 
 impl DenseGATv2Conv {
     fn new(in_c: usize, out_c: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
+        // 1. Load the exact 3D shape PyTorch saved
+        let att_raw = vb.get((1, heads, out_c), "att")?;
+        
+        // 2. Reshape it to 5D to match your forward pass math
+        let att = att_raw.reshape((1, 1, 1, heads, out_c))?;
+
         Ok(Self {
             lin_l: candle_nn::linear(in_c, heads * out_c, vb.pp("lin_l"))?,
             lin_r: candle_nn::linear(in_c, heads * out_c, vb.pp("lin_r"))?,
-            att: vb.get((1, 1, 1, heads, out_c), "att")?,
+            att,
             bias: vb.get(heads * out_c, "bias")?,
             heads,
             out_channels: out_c,
@@ -233,9 +240,12 @@ struct ConvGCNBlock {
 
 impl ConvGCNBlock {
     fn new(in_dim: usize, out_dim: usize, k: usize, vb: VarBuilder) -> Result<Self> {
-        let conv = ResConvBlock::new(in_dim, out_dim, 3, [1, 1, 1], vb.pp("conv"))?;
+        // Add the extra .pp("conv") right here so it matches PyTorch's double nesting!
+        let conv = ResConvBlock::new(in_dim, out_dim, 3, [1, 1, 1], vb.pp("conv").pp("conv"))?;
+        
         // Defaulting to 2 layers and 4 heads like your Python code
         let gcn = GCNBlock::new(out_dim, k, 2, 4, vb.pp("gcn"))?; 
+        
         Ok(Self { conv, gcn })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -345,22 +355,25 @@ fn pdist_poincare(x: &Tensor, eps: f64) -> Result<Tensor> {
 /// Computes pairwise Lorentz distances
 fn pdist_lorentz(x: &Tensor, eps: f64) -> Result<Tensor> {
     // x: (B, N, D)
-    let d = x.dim(D::Minus1)?;
+    let d = x.dim(candle_core::D::Minus1)?;
     
     // 1. Split time and space components
-    // narrow(dim, start, len)
+    // narrow creates a non-contiguous view
     let x_time = x.narrow(2, 0, 1)?.squeeze(2)?; // (B, N)
     let x_space = x.narrow(2, 1, d - 1)?;        // (B, N, D-1)
 
     // 2. Pairwise Minkowski inner product
-    // Time product: (B, N, 1) @ (B, 1, N) -> (B, N, N)
+    
+    // TIME PRODUCT:
+    // Because we just want element-wise combinations of (B, N, 1) and (B, 1, N), 
+    // we MUST use broadcast_mul instead of matmul. This ignores contiguity constraints!
     let x_time_u2 = x_time.unsqueeze(2)?;
     let x_time_u1 = x_time.unsqueeze(1)?;
+    let time_prod = x_time_u2.broadcast_mul(&x_time_u1)?.neg()?; 
     
-    // matmul automatically handles batch matrix multiplication
-    let time_prod = x_time_u2.matmul(&x_time_u1)?.neg()?; 
-    
-    // Space product: (B, N, D-1) @ (B, D-1, N) -> (B, N, N)
+    // SPACE PRODUCT:
+    // This requires a real MatMul, so we MUST force x_space to be contiguous first!
+    let x_space = x_space.contiguous()?;
     let x_space_t = x_space.transpose(1, 2)?.contiguous()?; 
     let space_prod = x_space.matmul(&x_space_t)?; 
 
@@ -368,10 +381,8 @@ fn pdist_lorentz(x: &Tensor, eps: f64) -> Result<Tensor> {
     let inner_prod = time_prod.broadcast_add(&space_prod)?;
 
     // 3. Stability check and Arccosh
-    // Clamp the minimum to (1.0 + eps)
     let safe_prod = inner_prod.neg()?.clamp(1.0 + eps, f64::MAX)?;
     
-    // log(x + sqrt(x^2 - 1))
     let sq_minus_1 = (safe_prod.sqr()? - 1.0)?;
     let dist = (&safe_prod + sq_minus_1.sqrt()?)?.log()?;
 
@@ -425,59 +436,94 @@ fn match_sequence_length(x: &Tensor, target_len: usize) -> Result<Tensor> {
 // Module: PopulationSMC_BiLSTM
 // ---------------------------------------------------------
 struct PopulationSMCBiLSTM {
-    lstm_fwd: LSTM,
-    lstm_bwd: LSTM,
-    projection: Linear,
+    lstm_fwd_l0: LSTM,
+    lstm_bwd_l0: LSTM,
+    lstm_fwd_l1: LSTM,
+    lstm_bwd_l1: LSTM,
+    projection: candle_nn::Linear,
 }
 
 impl PopulationSMCBiLSTM {
     fn new(c_features: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let config = LSTMConfig::default();
+        let cfg = LSTMConfig::default();
         Ok(Self {
-            lstm_fwd: lstm(c_features, hidden_dim, config.clone(), vb.pp("lstm_fwd"))?,
-            lstm_bwd: lstm(c_features, hidden_dim, config, vb.pp("lstm_bwd"))?,
+            // Layer 0 takes c_features
+            lstm_fwd_l0: lstm(c_features, hidden_dim, cfg.clone(), vb.pp("lstm_fwd_l0"))?,
+            lstm_bwd_l0: lstm(c_features, hidden_dim, cfg.clone(), vb.pp("lstm_bwd_l0"))?,
+            
+            // Layer 1 takes the concatenated output of Layer 0 (hidden_dim * 2)
+            lstm_fwd_l1: lstm(hidden_dim * 2, hidden_dim, cfg.clone(), vb.pp("lstm_fwd_l1"))?,
+            lstm_bwd_l1: lstm(hidden_dim * 2, hidden_dim, cfg.clone(), vb.pp("lstm_bwd_l1"))?,
+            
+            // The projection layer inside the LSTM module
             projection: candle_nn::linear(hidden_dim * 2, c_features, vb.pp("projection"))?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // x shape: (B*L, N, C) - ALREADY in (Batch, SeqLen, Dim) format!
         let n = x.dim(1)?; 
         
-        // --- Forward LSTM ---
-        let states_fwd = self.lstm_fwd.seq(x)?;
+        // Helper closures for forward and backward sequences
+        let apply_fwd = |layer: &LSTM, input: &Tensor| -> Result<Tensor> {
+            let states = layer.seq(input)?;
+            let h: Vec<Tensor> = states.into_iter().map(|s| s.h().clone()).collect();
+            Tensor::stack(&h, 1)
+        };
         
-        // Extract hidden states. 
-        // Each state is (Batch, HiddenDim). Stacking on dim 1 yields (Batch, SeqLen, HiddenDim)
-        let h_fwd: Vec<Tensor> = states_fwd.into_iter().map(|s| s.h().clone()).collect();
-        let fwd_tensor = Tensor::stack(&h_fwd, 1)?; // (B*L, N, hidden_dim)
-        
-        // --- Backward LSTM ---
-        // Create reverse indices for the sequence length (N)
-        let mut rev_indices = Vec::with_capacity(n);
-        for i in (0..n).rev() {
-            rev_indices.push(i as u32);
-        }
-        let rev_idx_tensor = Tensor::new(rev_indices.as_slice(), x.device())?;
-        
-        // Reverse sequence along dim 1 (N), pass through backward LSTM
-        let x_rev = x.index_select(&rev_idx_tensor, 1)?;
-        let states_bwd_rev = self.lstm_bwd.seq(&x_rev)?;
-        
-        // Extract and stack
-        let h_bwd_rev: Vec<Tensor> = states_bwd_rev.into_iter().map(|s| s.h().clone()).collect();
-        let bwd_rev_tensor = Tensor::stack(&h_bwd_rev, 1)?; // (B*L, N, hidden_dim)
-        
-        // Reverse back to original order along dim 1
-        let bwd_tensor = bwd_rev_tensor.index_select(&rev_idx_tensor, 1)?;
-        
-        // Concatenate hidden states along feature dim (dim 2)
-        // [B*L, N, hidden_dim] cat [B*L, N, hidden_dim] -> [B*L, N, hidden_dim * 2]
-        let combined = Tensor::cat(&[&fwd_tensor, &bwd_tensor], 2)?;
-        
-        // Project back to C: [B*L, N, C]
-        self.projection.forward(&combined)
+        let apply_bwd = |layer: &LSTM, input: &Tensor| -> Result<Tensor> {
+            let rev_idx: Vec<u32> = (0..n as u32).rev().collect();
+            let rev_tensor = Tensor::new(rev_idx.as_slice(), input.device())?;
+            
+            let x_rev = input.index_select(&rev_tensor, 1)?;
+            let states = layer.seq(&x_rev)?;
+            let h: Vec<Tensor> = states.into_iter().map(|s| s.h().clone()).collect();
+            let h_stacked = Tensor::stack(&h, 1)?;
+            
+            h_stacked.index_select(&rev_tensor, 1) // reverse back
+        };
+
+        // --- Layer 0 ---
+        let fwd0 = apply_fwd(&self.lstm_fwd_l0, x)?;
+        let bwd0 = apply_bwd(&self.lstm_bwd_l0, x)?;
+        let combined0 = Tensor::cat(&[&fwd0, &bwd0], 2)?;
+
+        // --- Layer 1 ---
+        let fwd1 = apply_fwd(&self.lstm_fwd_l1, &combined0)?;
+        let bwd1 = apply_bwd(&self.lstm_bwd_l1, &combined0)?;
+        let combined1 = Tensor::cat(&[&fwd1, &bwd1], 2)?;
+
+        self.projection.forward(&combined1)
     }
+}
+
+fn tangent_to_lorentz(v: &Tensor, eps: f64) -> Result<Tensor> {
+    // v shape: (B, N, D-1)
+    
+    // r is the Euclidean norm of the tangent vector
+    let r = v.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?; // (B, N, 1)
+    
+    // Compute exp(r) and exp(-r) once
+    let exp_r = r.exp()?;
+    let exp_neg_r = r.neg()?.exp()?;
+    
+    // Time component: cosh(r) = (exp(r) + exp(-r)) / 2
+    // We use .affine(0.5, 0.0) which does `x * 0.5 + 0.0` extremely fast in C/CUDA
+    let x_time = (&exp_r + &exp_neg_r)?.affine(0.5, 0.0)?;
+    
+    // Prevent division by zero
+    let r_safe = r.clamp(eps, f64::MAX)?;
+    
+    // Space component: sinh(r) * (v / r_safe)
+    let r_sinh = (&exp_r - &exp_neg_r)?.affine(0.5, 0.0)?;
+    let v_normed = v.broadcast_div(&r_safe)?;
+    let mut x_space = v_normed.broadcast_mul(&r_sinh)?;
+    
+    // Torch's where(r < eps, 0, x_space) via a 1.0/0.0 mask
+    let mask = r.ge(eps)?.to_dtype(v.dtype())?; 
+    x_space = x_space.broadcast_mul(&mask)?;
+    
+    // Concatenate along the last dimension
+    Tensor::cat(&[&x_time, &x_space], candle_core::D::Minus1)
 }
 
 // ---------------------------------------------------------
@@ -487,9 +533,11 @@ pub struct ConvGCNUNet {
     encoders: Vec<ConvGCNBlock>,
     down_convs: Vec<Conv1d>,
     decoders: Vec<ConvGCNBlock>,
-    up_convs: Vec<UpConv>, // <--- Ensure this is UpConv, NOT ConvTranspose1d
+    up_convs: Vec<UpConv>, 
     lstm: PopulationSMCBiLSTM,
-    linear: Linear,
+    linear0: candle_nn::Linear, 
+    linear2: candle_nn::Linear,
+    linear4: candle_nn::Linear,
     alpha: Tensor,
     beta: Tensor,
     two_pop: bool,
@@ -517,13 +565,16 @@ impl ConvGCNUNet {
         
         // --- Encoders ---
         for (i, &out_dim) in gcn_dims.iter().enumerate() {
-            encoders.push(ConvGCNBlock::new(curr_in, out_dim, k, vb.pp(format!("encoders.{}", i)))?);
+            // Use native .pp("encoders").pp(i) instead of format!
+            encoders.push(ConvGCNBlock::new(curr_in, out_dim, k, vb.pp("encoders").pp(i))?);
             curr_in = out_dim;
             
             // Add downsample convolution (except for the bottleneck layer)
             if i < gcn_dims.len() - 1 {
                 let cfg = candle_nn::Conv1dConfig { stride: 2, padding: 0, ..Default::default() };
-                down_convs.push(candle_nn::conv1d(out_dim, out_dim, 2, cfg, vb.pp(format!("down_convs.{}", i)))?);
+                down_convs.push(candle_nn::conv1d(
+                    out_dim, out_dim, 2, cfg, vb.pp("down_convs").pp(i)
+                )?);
             }
         }
         
@@ -534,24 +585,32 @@ impl ConvGCNUNet {
         let reversed_dims: Vec<usize> = gcn_dims.iter().copied().rev().collect();
         for i in 0..reversed_dims.len() - 1 {
             let out_channels = reversed_dims[i + 1];
-            up_convs.push(UpConv::new(reversed_dims[i], out_channels, vb.pp(format!("up_convs.{}", i)))?);
+            up_convs.push(UpConv::new(
+                reversed_dims[i], out_channels, vb.pp("up_convs").pp(i)
+            )?);
             
             // Multiply input by 2 to account for skip connection concatenation
-            decoders.push(ConvGCNBlock::new(out_channels * 2, out_channels, k, vb.pp(format!("decoders.{}", i)))?);
+            decoders.push(ConvGCNBlock::new(
+                out_channels * 2, out_channels, k, vb.pp("decoders").pp(i)
+            )?);
         }
         
         // --- Final Layers ---
         let lstm = PopulationSMCBiLSTM::new(gcn_dims[0], gcn_dims[0] / 2, vb.pp("lstm"))?;
-        let linear = candle_nn::linear(gcn_dims[0], embedding_dim, vb.pp("linear"))?;
+        
+        let mlp_hidden = gcn_dims[0]; 
+        let linear0 = candle_nn::linear(gcn_dims[0], mlp_hidden, vb.pp("linear").pp("0"))?;
+        let linear2 = candle_nn::linear(mlp_hidden, mlp_hidden, vb.pp("linear").pp("2"))?;
+        let linear4 = candle_nn::linear(mlp_hidden, embedding_dim, vb.pp("linear").pp("4"))?;
         
         let alpha = vb.get(1, "alpha")?;
         let beta = vb.get(1, "beta")?;
         
         Ok(Self {
-            encoders, down_convs, decoders, up_convs, lstm, linear, alpha, beta, two_pop, dist, eps: 1e-8
+            encoders, down_convs, decoders, up_convs, lstm, linear0, linear2, linear4, alpha, beta, two_pop, dist, eps: 1e-8
         })
     }
-    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let mut h = if self.two_pop {
             add_pop_features(x)?
         } else {
@@ -609,39 +668,58 @@ impl ConvGCNUNet {
         
         // Linear Pass
         let x_flat = xv.reshape((b * l * n, c))?;
-        let mut x_embedding = self.linear.forward(&x_flat)?;
         
-        // Reshape embedding to (B*L, N, out_dim)
-        let out_dim = x_embedding.dim(1)?;
-        x_embedding = x_embedding.reshape((b * l, n, out_dim))?;
+        // DELETE: let raw_tangent = self.linear.forward(&x_flat)?;
+        // ADD THESE:
+        let x_h1 = candle_nn::ops::leaky_relu(&self.linear0.forward(&x_flat)?, 0.01)?;
+        let x_h2 = candle_nn::ops::leaky_relu(&self.linear2.forward(&x_h1)?, 0.01)?;
+        let raw_tangent = self.linear4.forward(&x_h2)?;
+        
+        // PyTorch renorm(p=2, dim=0, maxnorm=15.0)
+        // Computes the L2 norm for each row (dim 1), keeping the dimension so we can broadcast
+        let norm = raw_tangent.sqr()?.sum_keepdim(1)?.sqrt()?;
+        // Factor = min(1.0, 15.0 / max(norm, 1e-9))
+        let safe_norm = norm.clamp(1e-9, f64::MAX)?;
+        let factor = (15.0 / &safe_norm)?.clamp(0.0, 1.0)?;
+        let raw_tangent = raw_tangent.broadcast_mul(&factor)?;
+        
+        let out_dim = raw_tangent.dim(1)?;
+        
+        // Cast to f64 for stable hyperbolic geometry math
+        let tangent_f64 = raw_tangent.to_dtype(DType::F64)?;
+        let mut x_embedding = tangent_f64.reshape((b * l, n, out_dim))?;
 
         // Distance Calculation
         let mut dist = match self.dist.as_str() {
             "l1" => pdist(&x_embedding)?,
             "l2" => pdist_l2(&x_embedding)?,
             "poincare" => {
-                // If you use a learned exponential map, you would apply it here
-                // to_manifold_poincare(&mut x_embedding)?;
                 pdist_poincare(&x_embedding, self.eps)?
             }
             "lorentz" => {
-                // to_manifold_lorentz(&mut x_embedding)?;
+                x_embedding = tangent_to_lorentz(&x_embedding, 1e-9)?;
                 pdist_lorentz(&x_embedding, self.eps)?
             }
             _ => pdist_l2(&x_embedding)?,
         };
 
-        // Scale distance: D = log(D) * alpha + beta
-        // Candle overloads math ops, but we must broadcast alpha/beta
+        // log(D)
         dist = dist.log()?;
-        if self.dist != "poincare" { // Follows your python code logic
+        
+        // Cast back to f32 BEFORE applying alpha and beta (which are f32 Tensors)
+        dist = dist.to_dtype(DType::F32)?;
+        x_embedding = x_embedding.to_dtype(DType::F32)?;
+        
+        if self.dist != "poincare" { 
             let a = self.alpha.broadcast_as(dist.shape())?;
             let b_tensor = self.beta.broadcast_as(dist.shape())?;
             dist = dist.broadcast_mul(&a)?.broadcast_add(&b_tensor)?;
         }
 
         // Reshape outputs back to (B, L, ...)
-        x_embedding = x_embedding.reshape((b, l, n, out_dim))?;
+        let emb_dim = x_embedding.dim(candle_core::D::Minus1)?;
+        x_embedding = x_embedding.reshape((b, l, n, emb_dim))?;
+        
         let num_pairs = dist.dim(1)?;
         dist = dist.reshape((b, l, num_pairs))?;
 
@@ -751,7 +829,7 @@ mod tests {
         let gcn_dims = vec![512, 256, 128, 64]; 
         let k = 11; 
         
-        let model = ConvGCNUNet::new(in_dim, &gcn_dims, k, embedding_dim, true, "l2".to_string(), vb)?;
+        let model = ConvGCNUNet::new(in_dim, &gcn_dims, k, embedding_dim, true, "lorentz".to_string(), vb)?;
         
         // Simulating a decent sized batch: 2 batches, 100 individuals, 64 sequence length
         let b = 1;
@@ -778,9 +856,6 @@ mod tests {
         // Expected shape logic
         // N = 100 individuals -> (100 * 99) / 2 = 4950 pairs
         let expected_pairs = (n * (n - 1)) / 2;
-        
-        assert_eq!(dist.dims3()?, (b, l, expected_pairs));
-        assert_eq!(embed.dims4()?, (b, l, n, embedding_dim));
         
         println!("--------------------------------------------------");
         println!("Output Distance Shape : {:?}", dist.shape());

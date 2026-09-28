@@ -15,8 +15,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # --- Core Rust ML & Math ---
-candle-core = "0.8.0"
-candle-nn = "0.8.0"
+candle-core = { version = "0.11.0", features = ["cuda"] }
+candle-nn = { version = "0.11.0", features = ["cuda"] }
 safetensors = "0.4.1"
 
 # --- Python Interop (Leave if you want PyO3, remove if pure Rust) ---
@@ -31,6 +31,7 @@ rustfft = "6.1"
 num-complex = "0.4"
 rand = "0.8"
 rand_distr = "0.4"
+indicatif = "0.17"
 
 # --- Utilities & IO ---
 anyhow = "1.0"

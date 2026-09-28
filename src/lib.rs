@@ -11,6 +11,9 @@ use ndarray::parallel::prelude::IndexedParallelIterator;
 use ndarray::parallel::prelude::IntoParallelRefIterator;
 use ndarray::parallel::prelude::ParallelIterator;
 
+pub mod layers;
+pub mod regressors;
+
 // 1. Your internal Rust Enum
 #[derive(Clone)]
 pub enum RealWavelet {
