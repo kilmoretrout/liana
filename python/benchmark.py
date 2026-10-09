@@ -307,7 +307,9 @@ def main():
         'relate_kc', 'custom_kc', 
         'relate_rf', 'custom_rf', 
         'relate_rms_log_coal', 'custom_rms_log_coal', 
-        'relate_chamfer', 'custom_chamfer'
+        'relate_chamfer', 'custom_chamfer',
+        'relate_ntrees', 'custrom_ntrees',
+        'relate_kl', 'custom_kl'
     ]
     
     with open(args.output, 'w', newline='') as csvfile:
@@ -336,6 +338,9 @@ def main():
                     # Extract tensors from LMDB
                     x = data['x'].astype(np.float32)
                     pos = data['pos']
+                    
+                    
+                    
                     params = data.get('params', {})
                     ts_true = PGTreeSequence.from_tskit(data['ts'])
                     

@@ -88,8 +88,8 @@ def main():
     
     # --- Open LMDB Environment ---
     # map_size is the virtual memory limit (1TB here). It will be a sparse file on Linux.
-    db_path = os.path.join(args.odir, 'simulations.lmdb')
-    env = lmdb.open(db_path, map_size=1099511627776) 
+    db_path = os.path.join(args.odir, f'simulations_{args.job_id}.lmdb')
+    env = lmdb.open(db_path, map_size=1099511627776)
     
     for ix in range(args.n_replicates):
         ret = sim.simulate(verbose = True)
