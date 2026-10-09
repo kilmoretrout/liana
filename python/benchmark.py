@@ -417,6 +417,12 @@ def main():
                             
                             'relate_chamfer': ts_est_relate.breakpoint_chamfer_distance(ts_true),
                             'custom_chamfer': ts_est_custom.breakpoint_chamfer_distance(ts_true),
+                            
+                            'relate_ntrees': np.abs(len(ts_est_relate.trees) - len(ts_true.trees)),
+                            'custom_ntrees': np.abs(len(ts_est_custom.trees) - len(ts_true.trees)),
+                            
+                            'relate_kl': ts_est_relate.average_symmetric_kl_divergence(ts_true),
+                            'custom_kl': ts_est_custom.average_symmetric_kl_divergence(ts_true),
                         })
                         if args.verbose:
                             logging.info(f"[{key_str}] Relate: {relate_time:.2f}s | "
