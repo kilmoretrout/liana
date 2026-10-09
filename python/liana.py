@@ -34,6 +34,7 @@ def parse_args():
     # Target individuals and sequence length
     parser.add_argument("--target_ind", type=int, default=32)
     parser.add_argument("--L", type=float, default=23_000_000.0, help="Total length of the sequence in bp")
+    parser.add_argument("--window_size", default = 2e6, type = float)
     
     args = parser.parse_args()
 
@@ -148,7 +149,7 @@ def main():
     # ---------------------------------------------------------
     # 3. Stream Inference over 1Mb Windows
     # ---------------------------------------------------------
-    window_size_bp = 2_000_000.0
+    window_size_bp = args.window_size
     current_bp = 0.0
     chunk_start_idx = 0
     total_base_pairs = float(pos_ndarray[-1]) if num_snps > 0 else 0.0

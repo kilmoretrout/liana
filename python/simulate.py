@@ -150,7 +150,8 @@ def main():
             'pos': ret['pos'],
             'coal': np.array(coal_times),
             'D': Ds,
-            'params': sim.params
+            'params': sim.params,
+            'ts': ts,
         }
         
         # 2. Serialize to bytes using fastest C-pickler protocol available
