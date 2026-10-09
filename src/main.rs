@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
 use memmap2::MmapOptions;
@@ -29,6 +30,7 @@ fn get_idx(n: usize, i: usize, j: usize) -> usize {
 #[derive(Clone, Debug)]
 pub struct Tree {
     pub topology_hash: String,
+    pub clades: Vec<String>, // Tracks the canonical string for each internal node
     pub merges: Vec<(usize, usize)>,
     pub node_times: Vec<f32>,
 }
@@ -47,6 +49,7 @@ pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
     let mut cluster_size = vec![1.0; n * 2];
     let mut topologies = vec![String::new(); n * 2];
     
+    let mut clades = Vec::with_capacity(n - 1);
     let mut merges = Vec::with_capacity(n - 1);
     let mut node_times = Vec::with_capacity(n - 1);
     
@@ -79,13 +82,13 @@ pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
 
         node_times.push(min_d / 2.0);
 
-        // Sorting the string representations creates a canonical topology hash
-        // guaranteeing that ((0,1),2) and (2,(1,0)) map to the exact same string
         let mut children = [topologies[min_i].clone(), topologies[min_j].clone()];
         children.sort(); 
         topologies[next_node] = format!("({},{})", children[0], children[1]);
+        
+        // Save this node's canonical topology as a distinct clade
+        clades.push(topologies[next_node].clone());
 
-        // Keep merge tuples sorted identically for Newick generation later
         if topologies[min_i] < topologies[min_j] {
             merges.push((min_i, min_j));
         } else {
@@ -108,12 +111,81 @@ pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
 
     Tree {
         topology_hash: topologies[next_node - 1].clone(),
+        clades,
         merges,
         node_times,
     }
 }
 
-// Reconstructs a standard Newick string using the AVERAGED coalescent times
+// ---------------------------------------------------------
+// Clade Smoothing & Harmonic Averaging
+// ---------------------------------------------------------
+fn average_clade_times(trees: &[Tree]) -> Vec<Vec<f32>> {
+    let mut runs: Vec<(Vec<f32>, Vec<usize>)> = Vec::new();
+    let mut active_runs: HashMap<&str, usize> = HashMap::new(); // Zero-allocation tracking!
+    
+    // Pass 1: Extract clades and group into contiguous runs
+    for (tree_idx, tree) in trees.iter().enumerate() {
+        let mut current_clades = HashMap::new();
+        for (i, clade) in tree.clades.iter().enumerate() {
+            current_clades.insert(clade.as_str(), tree.node_times[i]);
+        }
+        
+        let current_clade_set: HashSet<&str> = current_clades.keys().copied().collect();
+        let active_clade_set: HashSet<&str> = active_runs.keys().copied().collect();
+        
+        // End tracking for clades no longer in current tree
+        for clade in active_clade_set.difference(&current_clade_set) {
+            active_runs.remove(clade);
+        }
+        
+        // Update continuing and start new runs
+        for (clade, time) in current_clades {
+            let run_idx = *active_runs.entry(clade).or_insert_with(|| {
+                let idx = runs.len();
+                runs.push((Vec::new(), Vec::new()));
+                idx
+            });
+            runs[run_idx].0.push(time);
+            runs[run_idx].1.push(tree_idx);
+        }
+    }
+    
+    // Pass 2: Calculate harmonic averages
+    let mut result = vec![Vec::with_capacity(trees[0].clades.len()); trees.len()];
+    
+    for (times, tree_indices) in runs {
+        let mut has_zero = false;
+        let mut sum_inv = 0.0;
+        
+        for &t in &times {
+            if t <= 0.0 {
+                has_zero = true;
+                break;
+            }
+            sum_inv += 1.0 / t;
+        }
+        
+        let avg_time = if has_zero || sum_inv == 0.0 {
+            0.0
+        } else {
+            (times.len() as f32) / sum_inv
+        };
+        
+        for &idx in &tree_indices {
+            result[idx].push(avg_time);
+        }
+    }
+    
+    // Sort times for each tree to ensure monotonic increasing heights for UPGMA
+    for res in &mut result {
+        res.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    
+    result
+}
+
+// Reconstructs a standard Newick string using the SMOOTHED coalescent times
 fn build_newick(n: usize, merges: &[(usize, usize)], node_times: &[f32]) -> String {
     let mut heights = vec![0.0; n * 2];
     let mut strings = vec![String::new(); n * 2];
@@ -157,7 +229,6 @@ fn main() -> anyhow::Result<()> {
         
         let pos: f32 = cols[1].parse()?;
         
-        // Emulate Python's `if not np.all(row_arr == row_arr[0]):`
         let mut first_val = -1.0;
         let mut is_uniform = true;
         
@@ -165,14 +236,22 @@ fn main() -> anyhow::Result<()> {
             let gt_base = cols[i].split(':').next().unwrap_or("0");
             let val = if gt_base.contains('.') { 0.5 } else if gt_base.contains('1') { 1.0 } else { 0.0 };
             
-            if i == 9 {
+            // Skip missing data when determining if the site is uniform
+            if val == 0.5 {
+                continue; 
+            }
+            
+            // Lock in the first non-missing value we see
+            if first_val == -1.0 {
                 first_val = val;
             } else if val != first_val {
+                // We found a non-missing value that differs from our locked value
                 is_uniform = false;
-                break; // Short circuit as soon as variation is found
+                break;
             }
         }
         
+        // If the site is NOT uniform (i.e. it's polymorphic), save the position
         if !is_uniform {
             pos_vec.push(pos);
         }
@@ -207,7 +286,23 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    // 4. Collapse Regions and Write TSV
+    // 4. Clade Smoothing (Bidirectional Harmonic Averaging)
+    println!("Smoothing coalescent times bidirectionally...");
+    let forward_times = average_clade_times(&trees);
+    
+    let mut rev_trees = trees.clone();
+    rev_trees.reverse();
+    let mut backward_times = average_clade_times(&rev_trees);
+    backward_times.reverse(); // Flip back to match original orientation
+
+    let mut smoothed_times = vec![vec![0.0; n - 1]; sequence_length];
+    for i in 0..sequence_length {
+        for j in 0..(n - 1) {
+            smoothed_times[i][j] = (forward_times[i][j] + backward_times[i][j]) / 2.0;
+        }
+    }
+
+    // 5. Collapse Regions and Write TSV
     println!("Collapsing identical topologies and writing TSV...");
     let out_file = File::create(&args.output)?;
     let mut writer = BufWriter::new(out_file);
@@ -215,38 +310,25 @@ fn main() -> anyhow::Result<()> {
 
     let mut current_topology = trees[0].topology_hash.clone();
     let mut current_merges = trees[0].merges.clone();
-    let mut current_times = trees[0].node_times.clone();
     let mut start_idx = 0;
-    let mut count = 1.0;
-
     let mut num_regions = 0;
 
+    // Because times are perfectly smoothed across identical topologies, 
+    // we can just pick the times at `start_idx` to build the Newick tree!
     for i in 1..sequence_length {
-        if trees[i].topology_hash == current_topology {
-            for (acc, t) in current_times.iter_mut().zip(&trees[i].node_times) {
-                *acc += t;
-            }
-            count += 1.0;
-        } else {
-            // Region boundary! Average times and write Newick
-            for acc in current_times.iter_mut() { *acc /= count; }
-            
-            let newick = build_newick(n, &current_merges, &current_times);
+        if trees[i].topology_hash != current_topology {
+            let newick = build_newick(n, &current_merges, &smoothed_times[start_idx]);
             writeln!(writer, "{:.0}\t{:.0}\t{}", pos_vec[start_idx], pos_vec[i], newick)?;
             num_regions += 1;
 
-            // Reset
             current_topology = trees[i].topology_hash.clone();
             current_merges = trees[i].merges.clone();
-            current_times = trees[i].node_times.clone();
             start_idx = i;
-            count = 1.0;
         }
     }
 
     // Write final region
-    for acc in current_times.iter_mut() { *acc /= count; }
-    let newick = build_newick(n, &current_merges, &current_times);
+    let newick = build_newick(n, &current_merges, &smoothed_times[start_idx]);
     writeln!(writer, "{:.0}\t{:.0}\t{}", pos_vec[start_idx], pos_vec[sequence_length - 1], newick)?;
     num_regions += 1;
     
