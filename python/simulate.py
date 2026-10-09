@@ -17,6 +17,7 @@ from scipy.spatial.distance import squareform
 import itertools
 import sys
 import lmdb
+import zlib
 
 def tree_to_dist_mat(tree):
     tree = tree.split_polytomies()
@@ -138,7 +139,7 @@ def main():
                 else:
                     break
         
-        Ds = np.array(Ds)
+        Ds = np.array(Ds, dtype = np.float32)
         print('have {} trees...'.format(Ds.shape[0]))
         sys.stdout.flush()
         
@@ -148,21 +149,22 @@ def main():
             'x': ret['x'].astype(np.uint8),
             'intervals': np.array(intervals),
             'pos': ret['pos'],
-            'coal': np.array(coal_times),
+            'coal': np.array(coal_times, dtype = np.float32),
             'D': Ds,
             'params': sim.params,
         }
         
         # 2. Serialize to bytes using fastest C-pickler protocol available
+        # Serialize to bytes using fastest C-pickler protocol available
         byte_data = pickle.dumps(data_dict, protocol=-1)
         
-        # 3. Create a unique key combining job_id and replicate index
-        # Format: "00000012_00000450" (Job 12, Replicate 450)
+        # Compress the bytes (level 3 is a great balance of speed vs compression)
+        compressed_data = zlib.compress(byte_data, level=3)
+        
         key = f"{args.job_id:08d}_{ix:08d}".encode('ascii')
         
-        # 4. Write to the database
         with env.begin(write=True) as txn:
-            txn.put(key, byte_data)
+            txn.put(key, compressed_data)
             
     # Close the environment once the loop is finished
     env.close()
