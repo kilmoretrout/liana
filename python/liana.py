@@ -31,8 +31,9 @@ def parse_args():
     parser.add_argument("--wav_param", default=1, type=int)
     parser.add_argument("--dist", default="lorentz")
     
-    # Target individuals for the benchmark
+    # Target individuals and sequence length
     parser.add_argument("--target_ind", type=int, default=32)
+    parser.add_argument("--L", type=float, default=23_000_000.0, help="Total length of the sequence in bp")
     
     args = parser.parse_args()
 
@@ -44,7 +45,7 @@ def parse_args():
         
     return args
 
-def load_and_filter_vcf(vcf_path, target_ind=32):
+def load_and_filter_vcf(vcf_path, target_ind=32, total_L=None):
     """Parses VCF, sets missing to 0.5, and drops uniform sites for the first target_ind individuals."""
     logging.info(f"Parsing VCF: {vcf_path}")
     
@@ -64,24 +65,33 @@ def load_and_filter_vcf(vcf_path, target_ind=32):
             pos = float(cols[1])
             gts = cols[9:9+target_ind]
             
+            has_ref = False
+            has_alt = False
             row = []
+            
             for gt_str in gts:
                 gt_base = gt_str.split(':')[0]
                 if '.' in gt_base:
                     row.append(0.5)
                 elif '1' in gt_base:
                     row.append(1.0)
+                    has_alt = True
                 else:
                     row.append(0.0)
+                    has_ref = True
                     
-            row_arr = np.array(row, dtype=np.float32)
-            
             # Filter uniform sites
-            if not np.all(row_arr == row_arr[0]):
+            if has_ref and has_alt:
                 pos_list.append(pos)
-                geno_list.append(row_arr)
+                geno_list.append(np.array(row, dtype=np.float32))
                 
     pos_ndarray = np.array(pos_list, dtype=np.float32)
+    
+    # If positions are fractional [0, 1] (e.g. from msprime), scale them to physical bp!
+    if total_L is not None and pos_ndarray[-1] <= 1.05:
+        logging.info(f"Fractional positions detected. Scaling by L={total_L:g}")
+        pos_ndarray *= total_L
+        
     # Shape: (Individuals, SNPs)
     x_ndarray = np.stack(geno_list, axis=1) 
     
@@ -132,16 +142,18 @@ def main():
     # ---------------------------------------------------------
     # 2. Parse VCF
     # ---------------------------------------------------------
-    x_ndarray, pos_ndarray = load_and_filter_vcf(args.vcf, target_ind=args.target_ind)
+    x_ndarray, pos_ndarray = load_and_filter_vcf(args.vcf, target_ind=args.target_ind, total_L=args.L)
     num_ind, num_snps = x_ndarray.shape
     
     # ---------------------------------------------------------
     # 3. Stream Inference over 1Mb Windows
     # ---------------------------------------------------------
-    window_size_bp = 1_000_000.0
+    window_size_bp = 2_000_000.0
     current_bp = 0.0
     chunk_start_idx = 0
     total_base_pairs = float(pos_ndarray[-1]) if num_snps > 0 else 0.0
+    
+    MIN_SNPS = 1024 
     
     out_file = open(args.ofile, "wb")
     pbar = tqdm(total=int(total_base_pairs), unit="bp", desc="Streaming Predictions")
@@ -156,25 +168,57 @@ def main():
                 
             if chunk_end_idx == chunk_start_idx:
                 current_bp = target_bp
-                pbar.update(window_size_bp)
+                pbar.update(int(window_size_bp))
                 continue
                 
-            # Extract current chunk
-            x_chunk = x_ndarray[:, chunk_start_idx:chunk_end_idx]
-            pos_chunk = pos_ndarray[chunk_start_idx:chunk_end_idx]
+            current_chunk_len = chunk_end_idx - chunk_start_idx
             
-            # Divide positions by 1,000,000 so the regressor's internal 
-            # `np.diff(pos)` calculation perfectly matches the Rust normalization!
-            pos_chunk_scaled = pos_chunk / window_size_bp
+            # ---------------------------------------------------------
+            # 4. Redundant Context Windowing & Local Position Scaling
+            # ---------------------------------------------------------
+            temp_start = chunk_start_idx
+            temp_end = chunk_end_idx
             
-            # Predict using your class
-            t0 = time.time()
-            D_pred = reg.predict(x_chunk, pos_chunk_scaled)
+            # Borrow context if the chunk is too small
+            if temp_end - temp_start < MIN_SNPS:
+                needed = MIN_SNPS - (temp_end - temp_start)
+                temp_start = max(0, temp_start - needed)
+                if temp_end - temp_start < MIN_SNPS:
+                    needed = MIN_SNPS - (temp_end - temp_start)
+                    temp_end = min(num_snps, temp_end + needed)
+            
+            x_chunk = x_ndarray[:, temp_start:temp_end]
+            pos_chunk = pos_ndarray[temp_start:temp_end]
+            
+            # ---------------------------------------------------------
+            # CRITICAL FIX: Localize positions to the CURRENT window
+            # By subtracting current_bp, the network sees local coords [0, 1] 
+            # instead of massive global coordinates like 23.5!
+            # ---------------------------------------------------------
+            pos_chunk_scaled = (pos_chunk - current_bp) / window_size_bp
+            
+            # Zero pad if the whole chromosome is still smaller than MIN_SNPS
+            actual_len = temp_end - temp_start
+            pad_len = 0
+            if actual_len < MIN_SNPS:
+                pad_len = MIN_SNPS - actual_len
+                x_chunk = np.pad(x_chunk, ((0,0), (0, pad_len)), mode='constant')
+                # Pad edges so the diffs don't artificially spike
+                pos_chunk_scaled = np.pad(pos_chunk_scaled, (0, pad_len), mode='edge')
+            
+            # Predict using the full context
+            D_pred_padded = reg.predict(x_chunk, pos_chunk_scaled)
+            
+            if pad_len > 0:
+                D_pred_padded = D_pred_padded[:-pad_len, :]
+                
+            # SLICE MAGIC: Extract ONLY the segment belonging to our original target chunk
+            offset = chunk_start_idx - temp_start
+            D_pred = D_pred_padded[offset : offset + current_chunk_len, :]
             
             # Stream exactly identically to Rust: float32 raw bytes
             D_pred.astype(np.float32).tofile(out_file)
             
-            # Update loop variables and UI
             pbar.update(int(window_size_bp))
             current_bp = target_bp
             chunk_start_idx = chunk_end_idx
