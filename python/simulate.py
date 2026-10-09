@@ -152,6 +152,7 @@ def main():
             'coal': np.array(coal_times, dtype = np.float32),
             'D': Ds,
             'params': sim.params,
+            'ts' : ts
         }
         
         # 2. Serialize to bytes using fastest C-pickler protocol available
