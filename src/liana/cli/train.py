@@ -218,152 +218,155 @@ class DiskWaveletDataset(IterableDataset):
                 except Exception as e:
                     print(f"Failed to unpickle key {key.decode('ascii', 'ignore')}: {e}")
                     continue
+            except Exception as e:
+                print(f"Error processing {key} from {lmdb_path}: {e}")
+                continue
                 
-                x = data['x'].astype(np.float32)
+            x = data['x'].astype(np.float32)
+            
+            # Use .get() for optional keys depending on if this is a training or benchmarking LMDB
+            y = data.get('D')
+            ints = data.get('intervals')
+            pos = data.get('pos')
+            params = data.get('params', {})
+            
+            if self.n:
+                if x.shape[0] != self.n * 2:
+                    # randomly downsample the data (choosing some number of pairs)
+                    total_pairs = x.shape[0] // 2
+                    paired_indices = np.array([[2*u, 2*u + 1] for u in range(total_pairs)], dtype = np.int32)
+                    
+                    if getattr(self, 'two_pop', False): # Safely check if two_pop is True
+                        # Split the target number of pairs in half
+                        n1 = self.n // 2
+                        n2 = self.n - n1
+                        
+                        mid_point = total_pairs // 2
+                        
+                        # Sample n1 pairs from the first half
+                        idx1 = np.random.choice(mid_point, n1, replace=False)
+                        # Sample n2 pairs from the second half
+                        idx2 = np.random.choice(total_pairs - mid_point, n2, replace=False) + mid_point
+                        
+                        ii = np.concatenate([idx1, idx2])
+                    else:
+                        # Original logic: sample from the entire alignment
+                        ii = np.random.choice(total_pairs, self.n, replace=False)
+                        
+                    ii = np.sort(paired_indices[ii].flatten())
+                    
+                    ii_ = get_condensed_indices(ii, x.shape[0])
+                    
+                    # downsample
+                    x = x[ii]
+                    # downsample the condensed distance matrix
+                    y = y[:,ii_]
+                                
+                    # take out uniform sites
+                    xs = x.sum(0)
+                    ii = np.where((xs != 0) & (xs != x.shape[0]))[0]
+                    
+                    x = x[:,ii]
+                    pos = pos[ii]
+                    
+            if self.masks and x.shape[1] > 0:
+                L_x = x.shape[1]
+                N_x = x.shape[0]
                 
-                # Use .get() for optional keys depending on if this is a training or benchmarking LMDB
-                y = data.get('D')
-                ints = data.get('intervals')
-                pos = data.get('pos')
-                params = data.get('params', {})
+                # Pick a random mask
+                chosen_mask = self.masks[np.random.randint(len(self.masks))]
+                
+                # Ensure the mask is long enough (tile columns if it's shorter than L_x)
+                if chosen_mask.shape[1] < L_x:
+                    repeats = (L_x // chosen_mask.shape[1]) + 1
+                    chosen_mask = np.tile(chosen_mask, (1, repeats))
+                
+                # Randomly slice columns to match x.shape[1]
+                max_start_col = chosen_mask.shape[1] - L_x
+                start_col = np.random.randint(0, max_start_col + 1) if max_start_col > 0 else 0
+                mask_slice = chosen_mask[:, start_col : start_col + L_x]
+                
+                # Randomly sample rows to match x.shape[0]
+                M_rows = mask_slice.shape[0]
+                row_indices = range(N_x)
+                final_mask = mask_slice[row_indices, :]
+                
+                # Force masked values to 0.5
+                x[final_mask == 1] = 0.5
+                
+                # --- Filter out invalid columns ---
+                # Check which columns contain at least one 0
+                has_zero = np.any(x == 0, axis=0)
+                
+                # Check which columns contain at least one 1
+                has_one = np.any(x == 1, axis=0)
+                
+                # Keep only columns that have both
+                cols_to_keep = has_zero & has_one
+                
+                # Overwrite x with the filtered array
+                x = x[:, cols_to_keep]
+                pos = pos[cols_to_keep]
+            
+            pos_diff = np.diff(pos, append = np.zeros(1))
+            
+            Y = []
+            for k in range(y.shape[0]):
+                a, b = ints[k]
+                
+                ii_ = np.where((pos * self.L >= a) & (pos * self.L < b))[0]
+        
+                Y.extend([y[k] for u in range(len(ii_))])
+
+            Y = np.array(Y)            
+
+            # Apply original transformations
+            x = flip(x)
+            
+            with np.errstate(divide='ignore'):
+                Y = np.log(Y)
+            
+            if len(self.scales) > 0:
+                xw = pgml.compute_cwt(x, self.scales, config)
+                x_concat = np.concatenate([np.expand_dims(x, 0), xw])
+            else:
+                x_concat = np.expand_dims(x, 0)
+                
+            x_concat = np.concatenate([x_concat, np.tile(pos_diff.reshape(1, 1, -1), (1, x_concat.shape[1], 1))], 0)
+        
+            max_idx = max(1, x_concat.shape[2] - self.args.size)
+        
+            for ij in range(self.args.n_samples):
+                ii = np.random.randint(0, max_idx)
+                
+                X_chunk_np = x_concat[:, :, ii:ii + self.args.size]
+                D_chunk_np = Y[ii:ii + self.args.size] 
+                
+                X_tensor = torch.from_numpy(X_chunk_np).float()
+                D_tensor = torch.from_numpy(D_chunk_np).float()
+                
+                # Apply Internal Normalization
+                if self.mean_x is not None and len(self.scales) > 0:
                     
             
+                    mean_x_view = self.mean_x.view(-1, 1, 1)
+                    std_x_view = self.std_x.view(-1, 1, 1)
+                    
+                    X_norm = X_tensor.clone()
+                    X_norm[1:-1] = (X_tensor[1:-1] - mean_x_view) / std_x_view
+                    X_tensor = X_norm
                 
-                if self.n:
-                    if x.shape[0] != self.n * 2:
-                        # randomly downsample the data (choosing some number of pairs)
-                        total_pairs = x.shape[0] // 2
-                        paired_indices = np.array([[2*u, 2*u + 1] for u in range(total_pairs)], dtype = np.int32)
-                        
-                        if getattr(self, 'two_pop', False): # Safely check if two_pop is True
-                            # Split the target number of pairs in half
-                            n1 = self.n // 2
-                            n2 = self.n - n1
-                            
-                            mid_point = total_pairs // 2
-                            
-                            # Sample n1 pairs from the first half
-                            idx1 = np.random.choice(mid_point, n1, replace=False)
-                            # Sample n2 pairs from the second half
-                            idx2 = np.random.choice(total_pairs - mid_point, n2, replace=False) + mid_point
-                            
-                            ii = np.concatenate([idx1, idx2])
-                        else:
-                            # Original logic: sample from the entire alignment
-                            ii = np.random.choice(total_pairs, self.n, replace=False)
-                            
-                        ii = np.sort(paired_indices[ii].flatten())
-                        
-                        ii_ = get_condensed_indices(ii, x.shape[0])
-                        
-                        # downsample
-                        x = x[ii]
-                        # downsample the condensed distance matrix
-                        y = y[:,ii_]
-                                    
-                        # take out uniform sites
-                        xs = x.sum(0)
-                        ii = np.where((xs != 0) & (xs != x.shape[0]))[0]
-                        
-                        x = x[:,ii]
-                        pos = pos[ii]
-                        
-                if self.masks and x.shape[1] > 0:
-                    L_x = x.shape[1]
-                    N_x = x.shape[0]
-                    
-                    # Pick a random mask
-                    chosen_mask = self.masks[np.random.randint(len(self.masks))]
-                    
-                    # Ensure the mask is long enough (tile columns if it's shorter than L_x)
-                    if chosen_mask.shape[1] < L_x:
-                        repeats = (L_x // chosen_mask.shape[1]) + 1
-                        chosen_mask = np.tile(chosen_mask, (1, repeats))
-                    
-                    # Randomly slice columns to match x.shape[1]
-                    max_start_col = chosen_mask.shape[1] - L_x
-                    start_col = np.random.randint(0, max_start_col + 1) if max_start_col > 0 else 0
-                    mask_slice = chosen_mask[:, start_col : start_col + L_x]
-                    
-                    # Randomly sample rows to match x.shape[0]
-                    M_rows = mask_slice.shape[0]
-                    row_indices = range(N_x)
-                    final_mask = mask_slice[row_indices, :]
-                    
-                    # Force masked values to 0.5
-                    x[final_mask == 1] = 0.5
-                    
-                    # --- Filter out invalid columns ---
-                    # Check which columns contain at least one 0
-                    has_zero = np.any(x == 0, axis=0)
-                    
-                    # Check which columns contain at least one 1
-                    has_one = np.any(x == 1, axis=0)
-                    
-                    # Keep only columns that have both
-                    cols_to_keep = has_zero & has_one
-                    
-                    # Overwrite x with the filtered array
-                    x = x[:, cols_to_keep]
-                    pos = pos[cols_to_keep]
-                
-                pos_diff = np.diff(pos, append = np.zeros(1))
-                
-                Y = []
-                for k in range(y.shape[0]):
-                    a, b = ints[k]
-                    
-                    ii_ = np.where((pos * self.L >= a) & (pos * self.L < b))[0]
+                if self.mean_y is not None:
+                    valid_mask = torch.isfinite(D_tensor)
+                    D_tensor = torch.where(
+                        valid_mask, 
+                        (D_tensor - self.mean_y) / self.std_y, 
+                        D_tensor
+                    )
+
+                yield X_tensor, D_tensor + self.dilation
             
-                    Y.extend([y[k] for u in range(len(ii_))])
-    
-                Y = np.array(Y)            
-    
-                # Apply original transformations
-                x = flip(x)
-                
-                with np.errstate(divide='ignore'):
-                    Y = np.log(Y)
-                
-                if len(self.scales) > 0:
-                    xw = pgml.compute_cwt(x, self.scales, config)
-                    x_concat = np.concatenate([np.expand_dims(x, 0), xw])
-                else:
-                    x_concat = np.expand_dims(x, 0)
-                    
-                x_concat = np.concatenate([x_concat, np.tile(pos_diff.reshape(1, 1, -1), (1, x_concat.shape[1], 1))], 0)
             
-                max_idx = max(1, x_concat.shape[2] - self.args.size)
-            
-                for ij in range(self.args.n_samples):
-                    ii = np.random.randint(0, max_idx)
-                    
-                    X_chunk_np = x_concat[:, :, ii:ii + self.args.size]
-                    D_chunk_np = Y[ii:ii + self.args.size] 
-                    
-                    X_tensor = torch.from_numpy(X_chunk_np).float()
-                    D_tensor = torch.from_numpy(D_chunk_np).float()
-                    
-                    # Apply Internal Normalization
-                    if self.mean_x is not None and len(self.scales) > 0:
-                        
-                
-                        mean_x_view = self.mean_x.view(-1, 1, 1)
-                        std_x_view = self.std_x.view(-1, 1, 1)
-                        
-                        X_norm = X_tensor.clone()
-                        X_norm[1:-1] = (X_tensor[1:-1] - mean_x_view) / std_x_view
-                        X_tensor = X_norm
-                    
-                    if self.mean_y is not None:
-                        valid_mask = torch.isfinite(D_tensor)
-                        D_tensor = torch.where(
-                            valid_mask, 
-                            (D_tensor - self.mean_y) / self.std_y, 
-                            D_tensor
-                        )
-    
-                    yield X_tensor, D_tensor + self.dilation
                 
         # Clean up database handles when the epoch finishes
         for env in envs.values():
