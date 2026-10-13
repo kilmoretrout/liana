@@ -4,6 +4,7 @@ import argparse
 import logging
 
 from popgenml.data.simulators import MSPrimeSimulator, DiscoalSimulator
+from popgenml.data.functions import tree_to_distmat
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,19 +20,6 @@ import sys
 import lmdb
 import zlib
 
-def tree_to_dist_mat(tree):
-    tree = tree.split_polytomies()
-
-    leaf_nodes = sorted([u for u in tree.nodes() if tree.is_leaf(u)])
-    n = len(leaf_nodes)
-    
-    D = np.zeros((n * (n - 1) // 2,))
-
-    for ix, (i, j) in enumerate(itertools.combinations(leaf_nodes, 2)):
-        D[ix] = tree.distance_between(i, j)
-
-    return D
-
 def parse_args():
     # Argument Parser
     parser = argparse.ArgumentParser()
@@ -40,8 +28,6 @@ def parse_args():
     parser.add_argument("--n_replicates", default = 1, type = int)
     parser.add_argument("--ifile", default = "None")
 
-    parser.add_argument("--simple", action = "store_true")
-    parser.add_argument("--write_vcf", action = "store_true")
     parser.add_argument("--discoal", action = "store_true")
 
     parser.add_argument("--odir", default = "None")
@@ -64,18 +50,6 @@ def parse_args():
     # ${odir_del_block}
 
     return args
-
-def rescale_times(coal_times):
-    # n - 1
-    dcoal = np.diff(coal_times, prepend = 0.)
-    n = coal_times.shape[0] + 1
-    
-    n = np.array(range(n, 1, -1))
-    nC2 = n * (n - 1) / 2.    
-    
-    dcoal *= nC2
-    
-    return np.cumsum(dcoal)
 
 def main():
     args = parse_args()
@@ -103,11 +77,6 @@ def main():
         else:
             ij = 0
             tree = ts[ij].first()
-        
-        if args.write_vcf:
-            with open(os.path.join(args.odir, '{0:04d}.vcf'.format(ix)), "w") as f:
-                ts.write_vcf(f)
-            pickle.dump(ts, open(os.path.join(args.odir, '{0:04d}.pkl'.format(ix)), 'wb'))
             
         print('have genotype matrix shape: {}'.format(ret['x'].shape))
         sys.stdout.flush()
@@ -121,7 +90,7 @@ def main():
             intervals = ret['intervals']
             
         while True:
-            D = tree_to_dist_mat(tree)
+            D = tree_to_distmat(tree)
                   
             coal_times.append(sorted([tree.time(u) for u in tree.nodes() if not tree.is_leaf(u)]))
             

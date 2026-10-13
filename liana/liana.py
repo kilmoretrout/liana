@@ -1,114 +1,166 @@
 # -*- coding: utf-8 -*-
-import argparse
 import os
 import pickle
 import logging
-import gzip
-import time
 import numpy as np
 import torch
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from tqdm import tqdm
+import statistics
+import scipy.stats as stats
 
 # Your local modules
 from layers import ConvGCNUNet
 from regressors import UNetRegressor
 import pgml
+from popgenml.data.functions import distmat_to_tree 
+from popgenml.data import PGTreeSequence
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--verbose", action="store_true", help="display messages")
-    parser.add_argument("--weights", default="data/weights/gcn_n8/model.weights")
-    parser.add_argument("--vcf", required=True, help="Path to input VCF")
-    parser.add_argument("--ofile", default="predictions_output.bin", help="Output binary file")
-    
-    parser.add_argument("--min_log", default=1, type=int)
-    parser.add_argument("--max_log", default=10, type=int)
-    parser.add_argument("--n_scales", default=128, type=int)
-    
-    parser.add_argument("--embed_dim", default=32, type=int)
-    parser.add_argument("--k", default=11, type=int)
-    parser.add_argument("--wavelet", default="shannon")
-    parser.add_argument("--wav_param", default=1, type=int)
-    parser.add_argument("--dist", default="lorentz")
-    
-    # Target individuals and sequence length
-    parser.add_argument("--target_ind", type=int, default=32)
-    parser.add_argument("--L", type=float, default=23_000_000.0, help="Total length of the sequence in bp")
-    parser.add_argument("--window_size", default = 2e6, type = float)
-    
-    args = parser.parse_args()
+# =============================================================================
+# Helper Functions (Must be at module level for multiprocessing serialization)
+# =============================================================================
 
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-        logging.debug("running in verbose mode")
+def build_tree_worker(d_mat, method):
+    return distmat_to_tree(d_mat, method=method)[0]
+
+def make_coherent(coals, trees):
+    ret = dict()
+    ret['tree'] = []
+    ret['snps'] = []
+    ret['coal'] = []
+    
+    ii = 0
+    indices = [ii]
+    T = trees[ii]
+    _ = []
+    ints = []
+    
+    start = 0
+    
+    while ii < len(coals) - 1:
+        dist = trees[ii].kc_distance(trees[ii + 1])
+        
+        if dist > 0:
+            ints.append((start, start + len(indices)))
+            start += len(indices)
+            
+            ret['coal'].append(stats.hmean(np.array([coals[u] for u in indices]), axis = 0))
+            ret['snps'].append(len(indices))
+            ret['tree'].append(T)
+        
+            _.extend([ret['coal'][-1] for u in range(ret['snps'][-1])])
+        
+            indices = [ii + 1]
+            dist = 0
+        else:
+            indices.append(ii + 1)
+
+        ii += 1
+        T = trees[ii]
+        
+    ret['tree'].append(T)
+    ret['coal'].append(np.mean(np.array([coals[u] for u in indices]), axis = 0))
+    ret['snps'].append(len(indices))
+    ints.append((start, start + len(indices)))
+
+    _.extend([ret['coal'][-1] for u in range(ret['snps'][-1])])
+    
+    return np.array(_), ret['snps'], ret['tree'], ints, np.array(ret['coal'])
+
+def average_clade_times(tree_list):
+    """
+    Tracks clades across contiguous tskit trees, calculates the HARMONIC average 
+    of their coalescent times, and returns a list of lists of averaged times.
+    """
+    runs = [] 
+    active_runs = {} 
+    
+    for tree_idx, tree in enumerate(tree_list):
+        current_clades = {}
+        
+        for u in tree.nodes():
+            if not tree.is_sample(u):
+                clade = frozenset(tree.samples(u))
+                current_clades[clade] = tree.time(u)
+                
+        current_clade_set = set(current_clades.keys())
+        active_clade_set = set(active_runs.keys())
+        
+        for clade in active_clade_set - current_clade_set:
+            del active_runs[clade]
+            
+        for clade, time in current_clades.items():
+            if clade not in active_runs:
+                run_idx = len(runs)
+                runs.append({'clade': clade, 'times': [], 'trees': []})
+                active_runs[clade] = run_idx
+            
+            run_idx = active_runs[clade]
+            runs[run_idx]['times'].append(time)
+            runs[run_idx]['trees'].append(tree_idx)
+            
+    result = [[] for _ in range(len(tree_list))]
+    
+    for run in runs:
+        avg_time = statistics.harmonic_mean(run['times'])
+        for tree_idx in run['trees']:
+            result[tree_idx].append(avg_time)
+            
+    for i in range(len(result)):
+        result[i].sort()
+        
+    return result
+
+
+# =============================================================================
+# Main Standalone Inference Function
+# =============================================================================
+
+def liana(
+    weights: str,
+    x: np.ndarray,
+    pos: np.ndarray,
+    L: float = 2.5e6,
+    window_size: float = 2.5e6,
+    min_log: int = 1,
+    max_log: int = 10,
+    n_scales: int = 128,
+    embed_dim: int = 32,
+    k: int = 11,
+    wavelet: str = "shannon",
+    wav_param: int = 1,
+    dist: str = "lorentz",
+    method: str = "average",
+    num_workers: int = 4,
+    device_str: str = None
+) -> PGTreeSequence:
+    r"""
+    Runs model inference on a sequence of variants, builds marginal trees in parallel, 
+    post-processes coalescent times, and returns a PGTreeSequence.
+    
+    Args:
+        weights (str): Path to the model weights file.
+        x (np.ndarray): Binary genotype alignment array of shape (Individuals, SNPs).
+        pos (np.ndarray): Position array scaled from 0 to 1 of length SNPs.
+        L (float): Total length of the sequence in base pairs (used to scale pos).
+        window_size (float): Size of the sliding window in base pairs.
+        (Other args match the original argparse defaults).
+        
+    Returns:
+        PGTreeSequence: Coherent marginal trees mapped to SNP intervals.
+    """
+    
+    if device_str is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
-        logging.basicConfig(level=logging.INFO)
+        device = torch.device(device_str)
         
-    return args
+    logging.info(f"Using {device} for inference")
 
-def load_and_filter_vcf(vcf_path, target_ind=32, total_L=None):
-    """Parses VCF, sets missing to 0.5, and drops uniform sites for the first target_ind individuals."""
-    logging.info(f"Parsing VCF: {vcf_path}")
-    
-    open_func = gzip.open if vcf_path.endswith('.gz') else open
-    pos_list = []
-    geno_list = []
-    
-    with open_func(vcf_path, 'rt') as f:
-        for line in f:
-            if line.startswith('#'):
-                continue
-                
-            cols = line.strip().split('\t')
-            if len(cols) < 9:
-                continue
-                
-            pos = float(cols[1])
-            gts = cols[9:9+target_ind]
-            
-            has_ref = False
-            has_alt = False
-            row = []
-            
-            for gt_str in gts:
-                gt_base = gt_str.split(':')[0]
-                if '.' in gt_base:
-                    row.append(0.5)
-                elif '1' in gt_base:
-                    row.append(1.0)
-                    has_alt = True
-                else:
-                    row.append(0.0)
-                    has_ref = True
-                    
-            # Filter uniform sites
-            if has_ref and has_alt:
-                pos_list.append(pos)
-                geno_list.append(np.array(row, dtype=np.float32))
-                
-    pos_ndarray = np.array(pos_list, dtype=np.float32)
-    
-    # If positions are fractional [0, 1] (e.g. from msprime), scale them to physical bp!
-    if total_L is not None and pos_ndarray[-1] <= 1.05:
-        logging.info(f"Fractional positions detected. Scaling by L={total_L:g}")
-        pos_ndarray *= total_L
-        
-    # Shape: (Individuals, SNPs)
-    x_ndarray = np.stack(geno_list, axis=1) 
-    
-    logging.info(f"Kept {x_ndarray.shape[1]} polymorphic variants for {x_ndarray.shape[0]} individuals.")
-    return x_ndarray, pos_ndarray
-
-def main():
-    args = parse_args()
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("Using " + str(device) + " as device")
-    
-    # ---------------------------------------------------------
     # 1. Setup Model & Regressor
-    # ---------------------------------------------------------
-    weights_dir = '/'.join(args.weights.split('/')[:-1])
+    weights_dir = os.path.dirname(weights)
     pkl_path = os.path.join(weights_dir, 'train_val.pkl')
     stats_path = os.path.join(weights_dir, 'stats.npz')
     
@@ -122,111 +174,118 @@ def main():
         logging.warning("No stats found, using default 0,1 normalization")
         mu_x, std_x, mu_y, std_y = 0.0, 1.0, 0.0, 1.0
         
-    scales = np.unique((2 ** np.linspace(args.min_log, args.max_log, args.n_scales)).astype(np.int32))
-    model = ConvGCNUNet(in_dim=len(scales) + 2, embedding_dim=args.embed_dim, K=args.k, dist=args.dist).to(device)
+    scales = np.unique((2 ** np.linspace(min_log, max_log, n_scales)).astype(np.int32))
+    model = ConvGCNUNet(in_dim=len(scales) + 2, embedding_dim=embed_dim, K=k, dist=dist).to(device)
     
-    if args.wavelet == "shannon":
+    if wavelet == "shannon":
         config = pgml.WaveletConfig.shannon()
-    elif args.wavelet == "gaussian":
-        config = pgml.WaveletConfig.gaussian(order=int(args.wav_param))
+    elif wavelet == "gaussian":
+        config = pgml.WaveletConfig.gaussian(order=int(wav_param))
     else:
-        config = pgml.WaveletConfig.morlet(w0=args.wav_param)
+        config = pgml.WaveletConfig.morlet(w0=wav_param)
 
-    if args.weights != "None" and os.path.exists(args.weights):
-        model.load_state_dict(torch.load(args.weights, map_location=device), strict=False)
+    if weights != "None" and os.path.exists(weights):
+        model.load_state_dict(torch.load(weights, map_location=device), strict=False)
     
     model.eval()
-    
-    # Pass to your regressor
     reg = UNetRegressor(model, scales, mu_x, std_x, mu_y, std_y)
 
-    # ---------------------------------------------------------
-    # 2. Parse VCF
-    # ---------------------------------------------------------
-    x_ndarray, pos_ndarray = load_and_filter_vcf(args.vcf, target_ind=args.target_ind, total_L=args.L)
+    # 2. Prepare Data Arrays
+    x_ndarray = np.array(x, dtype=np.float32)
+    pos_ndarray = np.array(pos, dtype=np.float32)
     num_ind, num_snps = x_ndarray.shape
     
-    # ---------------------------------------------------------
+    # Scale fractional [0,1] positions up to physical base pairs for the window logic
+    if num_snps > 0 and pos_ndarray[-1] <= 1.05:
+        pos_ndarray *= L
+    
     # 3. Stream Inference over 1Mb Windows
-    # ---------------------------------------------------------
-    window_size_bp = args.window_size
+    window_size_bp = window_size
     current_bp = 0.0
     chunk_start_idx = 0
     total_base_pairs = float(pos_ndarray[-1]) if num_snps > 0 else 0.0
     
     MIN_SNPS = 1024 
-    
-    out_file = open(args.ofile, "wb")
-    pbar = tqdm(total=int(total_base_pairs), unit="bp", desc="Streaming Predictions")
+    trees_pred = []
+    pbar = tqdm(total=int(total_base_pairs), unit="bp", desc="Processing Windows")
 
-    with torch.no_grad():
-        while chunk_start_idx < num_snps:
-            target_bp = current_bp + window_size_bp
-            
-            chunk_end_idx = chunk_start_idx
-            while chunk_end_idx < num_snps and pos_ndarray[chunk_end_idx] < target_bp:
-                chunk_end_idx += 1
+    tree_func = partial(build_tree_worker, method=method)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        with torch.no_grad():
+            while chunk_start_idx < num_snps:
+                target_bp = current_bp + window_size_bp
                 
-            if chunk_end_idx == chunk_start_idx:
-                current_bp = target_bp
-                pbar.update(int(window_size_bp))
-                continue
+                chunk_end_idx = chunk_start_idx
+                while chunk_end_idx < num_snps and pos_ndarray[chunk_end_idx] < target_bp:
+                    chunk_end_idx += 1
+                    
+                if chunk_end_idx == chunk_start_idx:
+                    current_bp = target_bp
+                    pbar.update(int(window_size_bp))
+                    continue
+                    
+                current_chunk_len = chunk_end_idx - chunk_start_idx
                 
-            current_chunk_len = chunk_end_idx - chunk_start_idx
-            
-            # ---------------------------------------------------------
-            # 4. Redundant Context Windowing & Local Position Scaling
-            # ---------------------------------------------------------
-            temp_start = chunk_start_idx
-            temp_end = chunk_end_idx
-            
-            # Borrow context if the chunk is too small
-            if temp_end - temp_start < MIN_SNPS:
-                needed = MIN_SNPS - (temp_end - temp_start)
-                temp_start = max(0, temp_start - needed)
+                # Context Windowing
+                temp_start = chunk_start_idx
+                temp_end = chunk_end_idx
+                
                 if temp_end - temp_start < MIN_SNPS:
                     needed = MIN_SNPS - (temp_end - temp_start)
-                    temp_end = min(num_snps, temp_end + needed)
-            
-            x_chunk = x_ndarray[:, temp_start:temp_end]
-            pos_chunk = pos_ndarray[temp_start:temp_end]
-            
-            # ---------------------------------------------------------
-            # CRITICAL FIX: Localize positions to the CURRENT window
-            # By subtracting current_bp, the network sees local coords [0, 1] 
-            # instead of massive global coordinates like 23.5!
-            # ---------------------------------------------------------
-            pos_chunk_scaled = (pos_chunk - current_bp) / window_size_bp
-            
-            # Zero pad if the whole chromosome is still smaller than MIN_SNPS
-            actual_len = temp_end - temp_start
-            pad_len = 0
-            if actual_len < MIN_SNPS:
-                pad_len = MIN_SNPS - actual_len
-                x_chunk = np.pad(x_chunk, ((0,0), (0, pad_len)), mode='constant')
-                # Pad edges so the diffs don't artificially spike
-                pos_chunk_scaled = np.pad(pos_chunk_scaled, (0, pad_len), mode='edge')
-            
-            # Predict using the full context
-            D_pred_padded = reg.predict(x_chunk, pos_chunk_scaled)
-            
-            if pad_len > 0:
-                D_pred_padded = D_pred_padded[:-pad_len, :]
+                    temp_start = max(0, temp_start - needed)
+                    if temp_end - temp_start < MIN_SNPS:
+                        needed = MIN_SNPS - (temp_end - temp_start)
+                        temp_end = min(num_snps, temp_end + needed)
                 
-            # SLICE MAGIC: Extract ONLY the segment belonging to our original target chunk
-            offset = chunk_start_idx - temp_start
-            D_pred = D_pred_padded[offset : offset + current_chunk_len, :]
-            
-            # Stream exactly identically to Rust: float32 raw bytes
-            D_pred.astype(np.float32).tofile(out_file)
-            
-            pbar.update(int(window_size_bp))
-            current_bp = target_bp
-            chunk_start_idx = chunk_end_idx
-            
-    out_file.close()
+                x_chunk = x_ndarray[:, temp_start:temp_end]
+                pos_chunk = pos_ndarray[temp_start:temp_end]
+                pos_chunk_scaled = (pos_chunk - current_bp) / window_size_bp
+                
+                actual_len = temp_end - temp_start
+                pad_len = 0
+                if actual_len < MIN_SNPS:
+                    pad_len = MIN_SNPS - actual_len
+                    x_chunk = np.pad(x_chunk, ((0,0), (0, pad_len)), mode='constant')
+                    pos_chunk_scaled = np.pad(pos_chunk_scaled, (0, pad_len), mode='edge')
+                
+                D_pred_padded = reg.predict(x_chunk, pos_chunk_scaled)
+                
+                if pad_len > 0:
+                    D_pred_padded = D_pred_padded[:-pad_len, :]
+                    
+                offset = chunk_start_idx - temp_start
+                D_pred = D_pred_padded[offset : offset + current_chunk_len, :]
+                
+                # Parallel Tree Generation
+                chunk_trees = list(executor.map(tree_func, D_pred))
+                trees_pred.extend(chunk_trees)
+                
+                pbar.update(int(window_size_bp))
+                current_bp = target_bp
+                chunk_start_idx = chunk_end_idx
+                
     pbar.close()
-    print(f"Predictions streamed to {args.ofile}")
 
-if __name__ == "__main__":
-    main()
+    # 4. Post-processing Pipeline
+    if not trees_pred:
+        logging.warning("No trees were generated.")
+        return PGTreeSequence(trees=[], snps=[])
+
+    logging.info("Extracting coalescent times...")
+    coal_times_pred = []
+    for t in trees_pred:
+        c = [t.time(u) for u in t.nodes()]
+        c = sorted([u for u in c if u > 0])
+        coal_times_pred.append(c)
+
+    logging.info("Averaging clade times...")
+    coal_times_pred_fwd = np.array(average_clade_times(trees_pred))
+    coal_times_pred_rev = np.array(average_clade_times(trees_pred[::-1])[::-1])
+    coal_times_pred_avg = (coal_times_pred_fwd + coal_times_pred_rev) / 2.
+
+    logging.info("Making trees coherent...")
+    coal_times_pred_final, snps_coherent, trees_coherent, intervals, coal = make_coherent(coal_times_pred_avg, trees_pred)
+    
+    logging.info("Building PGTreeSequence...")
+    return PGTreeSequence(trees=trees_coherent, snps=snps_coherent)
