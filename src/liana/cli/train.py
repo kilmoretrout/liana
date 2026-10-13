@@ -21,6 +21,7 @@ import pandas as pd
 from popgenml.data.functions import flip
 import pgml
 from liana.models.layers import ConvGCNUNet
+import lmdb
 
 import warnings
 # Suppress msprime spam
