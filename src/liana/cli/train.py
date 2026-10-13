@@ -470,7 +470,7 @@ def main():
         
     # 1. Discover and shuffle all files
     data_dir = args.idir
-    all_files = glob.glob(os.path.join(data_dir, "*", "*.lmdb"))
+    all_files = glob.glob(os.path.join(data_dir, "*.lmdb"))
     
     # Use a fixed seed for shuffling so your split is reproducible across runs/resumes
     random.Random(42).shuffle(all_files)
