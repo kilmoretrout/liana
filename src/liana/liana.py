@@ -134,7 +134,8 @@ def liana(
     dist: str = "lorentz",
     method: str = "average",
     num_workers: int = 4,
-    device_str: str = None
+    device_str: str = None,
+    verbose: bool = False
 ) -> PGTreeSequence:
     r"""
     Runs model inference on a sequence of variants, builds marginal trees in parallel, 
@@ -157,7 +158,8 @@ def liana(
     else:
         device = torch.device(device_str)
         
-    logging.info(f"Using {device} for inference")
+    if verbose:
+        logging.info(f"Using {device} for inference")
 
     # 1. Setup Model & Regressor
     weights_dir = os.path.dirname(weights)
@@ -207,7 +209,8 @@ def liana(
     
     MIN_SNPS = 1024 
     trees_pred = []
-    pbar = tqdm(total=int(total_base_pairs), unit="bp", desc="Processing Windows")
+    if verbose:
+        pbar = tqdm(total=int(total_base_pairs), unit="bp", desc="Processing Windows")
 
     tree_func = partial(build_tree_worker, method=method)
 
@@ -222,7 +225,8 @@ def liana(
                     
                 if chunk_end_idx == chunk_start_idx:
                     current_bp = target_bp
-                    pbar.update(int(window_size_bp))
+                    if verbose:
+                        pbar.update(int(window_size_bp))
                     continue
                     
                 current_chunk_len = chunk_end_idx - chunk_start_idx
@@ -260,32 +264,29 @@ def liana(
                 # Parallel Tree Generation
                 chunk_trees = list(executor.map(tree_func, D_pred))
                 trees_pred.extend(chunk_trees)
-                
-                pbar.update(int(window_size_bp))
+                if verbose:
+                    pbar.update(int(window_size_bp))
                 current_bp = target_bp
                 chunk_start_idx = chunk_end_idx
-                
-    pbar.close()
+    if verbose:
+        pbar.close()
+        logging.info("Extracting coalescent times...")
 
     # 4. Post-processing Pipeline
     if not trees_pred:
         logging.warning("No trees were generated.")
         return PGTreeSequence(trees=[], snps=[])
 
-    logging.info("Extracting coalescent times...")
     coal_times_pred = []
     for t in trees_pred:
         c = [t.time(u) for u in t.nodes()]
         c = sorted([u for u in c if u > 0])
         coal_times_pred.append(c)
 
-    logging.info("Averaging clade times...")
     coal_times_pred_fwd = np.array(average_clade_times(trees_pred))
     coal_times_pred_rev = np.array(average_clade_times(trees_pred[::-1])[::-1])
     coal_times_pred_avg = (coal_times_pred_fwd + coal_times_pred_rev) / 2.
 
-    logging.info("Making trees coherent...")
     coal_times_pred_final, snps_coherent, trees_coherent, intervals, coal = make_coherent(coal_times_pred_avg, trees_pred)
     
-    logging.info("Building PGTreeSequence...")
     return PGTreeSequence(trees=trees_coherent, snps=snps_coherent)

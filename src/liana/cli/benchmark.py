@@ -12,12 +12,12 @@ import io
 import logging
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from tqdm import tqdm
 
 import torch
 
-# Your custom modeling modules
+# Your liana modeling modules
 from liana.models.layers import ConvGCNUNet
 from liana.models.regressors import UNetRegressor
 import pgml
@@ -46,6 +46,8 @@ def parse_args():
     # Samples Argument
     parser.add_argument("-n", "--n_samples", type=int, default=None,
                         help="Number of replicates/chunks to process per database. Defaults to all.")
+    
+    parser.add_argument("--n", default = 2, type = int, help = "number of diploid pairs to evaluate on")
     
     # Rust Builder Argument
     parser.add_argument("--tsq_builder", default="./target/release/tsq_builder",
@@ -86,7 +88,7 @@ def find_lmdb_envs(target_path):
 def summarize_results(csv_path: str, run_relate: bool, run_singer: bool):
     """Calculates and prints the relative percentage change in error metrics."""
     metrics = ['kc', 'rf', 'rms_log_coal', 'kl', 'chamfer', 'ntrees']
-    custom_sums = {m: 0.0 for m in metrics}
+    liana_sums = {m: 0.0 for m in metrics}
     relate_sums = {m: 0.0 for m in metrics}
     singer_sums = {m: 0.0 for m in metrics}
     count = 0
@@ -96,16 +98,16 @@ def summarize_results(csv_path: str, run_relate: bool, run_singer: bool):
         for row in reader:
             count += 1
             for m in metrics:
-                # Accumulate custom metrics
-                if row.get(f'custom_{m}') and row[f'custom_{m}'].strip():
+                # Accumulate liana metrics
+                if row.get(f'liana_{m}') and row[f'liana_{m}'].strip():
                     # Handle arrays for some metrics (like kc, rf) by taking the mean of the array
                     # If it's a string representation of an array, safely parse it
-                    val_str = row[f'custom_{m}']
+                    val_str = row[f'liana_{m}']
                     if '[' in val_str:
                         val = np.mean(np.fromstring(val_str.strip('[]'), sep=' '))
                     else:
                         val = float(val_str)
-                    custom_sums[m] += val
+                    liana_sums[m] += val
                 
                 # Accumulate relate metrics
                 if run_relate and row.get(f'relate_{m}') and row[f'relate_{m}'].strip():
@@ -129,7 +131,7 @@ def summarize_results(csv_path: str, run_relate: bool, run_singer: bool):
         return
         
     print("\n" + "="*80)
-    print(f"BENCHMARK SUMMARY ({count} replicates)")
+    print(f"BENCHMARK SUMMARY ({count} replicates), percentage improvement in error")
     print("="*80)
     
     # Header
@@ -138,26 +140,26 @@ def summarize_results(csv_path: str, run_relate: bool, run_singer: bool):
     print("-" * len(header))
     
     for m in metrics:
-        avg_custom = custom_sums[m] / count
+        avg_liana = liana_sums[m] / count
         
         relate_str = "N/A"
         if run_relate:
             avg_relate = relate_sums[m] / count
             if avg_relate > 0:
-                pct_diff = ((avg_custom - avg_relate) / avg_relate) * 100
-                relate_str = f"{pct_diff:>+6.1f}%"
+                pct_diff = ((avg_liana - avg_relate) / avg_relate) * 100
+                relate_str = f"{-pct_diff:>+6.1f}%"
                 
         singer_str = "N/A"
         if run_singer:
             avg_singer = singer_sums[m] / count
             if avg_singer > 0:
-                pct_diff = ((avg_custom - avg_singer) / avg_singer) * 100
-                singer_str = f"{pct_diff:>+6.1f}%"
+                pct_diff = ((avg_liana - avg_singer) / avg_singer) * 100
+                singer_str = f"{-pct_diff:>+6.1f}%"
                 
         print(f"{m:<20} | {relate_str:<20} | {singer_str:<20}")
     
     print("="*80)
-    print("Note: Negative percentages indicate Custom model has lower (better) error.\n")
+    print("Note: Positive percentages indicate Liana has lower (better) error.\n")
 
 
 def main():
@@ -180,7 +182,8 @@ def main():
             
             # Dynamically attach all training args to our current args namespace
             for key, value in parsed_args.items():
-                setattr(args, key, value)
+                if not (key in ["weights", "n"]):
+                    setattr(args, key, value)
                 
         # Force window_size to match L as specified in the JSON
         if hasattr(args, 'L'):
@@ -191,7 +194,7 @@ def main():
         logging.warning(f"arguments.json not found at {json_path}!")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using {device} for custom model inference")
+    print(f"Using {device} for liana model inference")
     
     # 2. Discover LMDBs
     lmdb_paths = sorted(find_lmdb_envs(args.input))
@@ -203,21 +206,22 @@ def main():
     # 3. Setup Outputs
     csv_columns = [
         'db_name', 'key', 'N_est', 
-        'relate_time', 'custom_time', 'singer_time',
-        'relate_kc', 'custom_kc', 'singer_kc',
-        'relate_rf', 'custom_rf', 'singer_rf',
-        'relate_rms_log_coal', 'custom_rms_log_coal', 'singer_rms_log_coal',
-        'relate_chamfer', 'custom_chamfer', 'singer_chamfer',
-        'relate_ntrees', 'custom_ntrees', 'singer_ntrees',
-        'relate_kl', 'custom_kl', 'singer_kl'
+        'relate_time', 'liana_time', 'singer_time',
+        'relate_kc', 'liana_kc', 'singer_kc',
+        'relate_rf', 'liana_rf', 'singer_rf',
+        'relate_rms_log_coal', 'liana_rms_log_coal', 'singer_rms_log_coal',
+        'relate_chamfer', 'liana_chamfer', 'singer_chamfer',
+        'relate_ntrees', 'liana_ntrees', 'singer_ntrees',
+        'relate_kl', 'liana_kl', 'singer_kl'
     ]
     
     with open(args.output, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
         writer.writeheader()
 
-        for db_path in lmdb_paths:
-            logging.info(f"Processing database: {db_path.name}")
+        db_path = lmdb_paths[0]
+
+        for db_path in tqdm(lmdb_paths, desc=f"Processing database: {db_path.name}"):
             env = lmdb.open(str(db_path), readonly=True, lock=False)
             
             with env.begin() as txn:
@@ -229,7 +233,7 @@ def main():
                     keys = keys[:args.n_samples]
                     
                 # Setup tqdm progress bar for the keys in this DB
-                for key in tqdm(keys, desc=f"Processing {db_path.name}"):
+                for key in keys:
                     value = txn.get(key)
                     key_str = key.decode('ascii')
                     
@@ -264,7 +268,7 @@ def main():
                         pos = pos[valid_sites]
                         
                     x = flip(x)
-                    
+                                        
                     # Build the evaluation PGTreeSequence
                     ts_true = PGTreeSequence.from_tskit(ts_raw, ii)
                     n_samples = x.shape[0]
@@ -292,7 +296,7 @@ def main():
                         singer_time = time.time() - start_time
                     
                     start_time = time.time()
-                    ts_est_custom = liana(args.weights, x, pos, args.L, args.window_size, device_str='cuda')
+                    ts_est_liana = liana(args.weights, x, pos, args.L, args.window_size, device_str='cuda')
                     pytorch_time = time.time() - start_time
                     
                     # ---------------------------------------------------------
@@ -303,13 +307,13 @@ def main():
                         'key': key_str,
                         'N_est': round(N_est, 2),
                         
-                        'custom_time': round(pytorch_time, 4),
-                        'custom_kc': ts_est_custom.kc_distance(ts_true),
-                        'custom_rf': ts_est_custom.rf_distance(ts_true),
-                        'custom_rms_log_coal': ts_est_custom.rms_log_coal_error(ts_true),
-                        'custom_kl': ts_est_custom.symmetric_kl_divergence(ts_true),
-                        'custom_chamfer': ts_est_custom.breakpoint_chamfer_distance(ts_true),
-                        'custom_ntrees': np.abs(len(ts_est_custom.trees) - len(ts_true.trees)),
+                        'liana_time': round(pytorch_time, 4),
+                        'liana_kc': ts_est_liana.kc_distance(ts_true),
+                        'liana_rf': ts_est_liana.rf_distance(ts_true),
+                        'liana_rms_log_coal': ts_est_liana.rms_log_coal_error(ts_true),
+                        'liana_kl': ts_est_liana.symmetric_kl_divergence(ts_true),
+                        'liana_chamfer': ts_est_liana.breakpoint_chamfer_distance(ts_true),
+                        'liana_ntrees': np.abs(len(ts_est_liana.trees) - len(ts_true.trees)),
                     }
                     
                     if run_relate:
