@@ -18,8 +18,8 @@ from tqdm import tqdm
 import torch
 
 # Your custom modeling modules
-from layers import ConvGCNUNet
-from regressors import UNetRegressor
+from liana.models.layers import ConvGCNUNet
+from liana.models.regressors import UNetRegressor
 import pgml
 import zlib
 
@@ -33,18 +33,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark Relate vs Custom GCN-UNet + Rust Builder on LMDB simulations.")
     
     # I/O Arguments
-    parser.add_argument("--input", type=str, required=True,
-                        help="Path to a single LMDB or a directory containing multiple LMDBs.")
-    parser.add_argument("--output", type=str, required=True,
+    parser.add_argument("-i", "--input", type=str, required=True,
+                    help="Path to a single LMDB or a directory containing multiple LMDBs.")
+    parser.add_argument("-o", "--output", type=str, required=True,
                         help="Path to save the benchmark results CSV.")
     parser.add_argument("--verbose", action="store_true", help="Print inference progress.")
     
     # Benchmarking Targets
-    parser.add_argument("--bench_against", choices=['all', 'singer', 'relate'], default='all',
+    parser.add_argument("-b", "--bench_against", choices=['all', 'singer', 'relate'], default='all',
                         help="Which baseline tools to benchmark against Liana. Default is 'all'.")
     
     # Samples Argument
-    parser.add_argument("--n_samples", type=int, default=None,
+    parser.add_argument("-n", "--n_samples", type=int, default=None,
                         help="Number of replicates/chunks to process per database. Defaults to all.")
     
     # Rust Builder Argument
@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument("--r", default=1.007e-8, type=float, help="Default recombination rate.")
     
     # Custom Model Arguments 
-    parser.add_argument("--weights", default="models/n16_k11_cheby/best_model.pth", help="Path to PyTorch weights")
+    parser.add_argument("-w", "--weights", default="models/n16_k11_cheby/best_model.pth", help="Path to PyTorch weights")
     
     args = parser.parse_args()
     

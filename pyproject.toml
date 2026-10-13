@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liana"
+version = "0.1.0"
+description = "Flexible framework for the inference of marginal tree sequences from population genetic alignments using wavelets and graph convolutions"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+liana_simulate = "liana.cli.simulate:main"
+liana_train = "liana.cli.train:main"
+liana_benchmark = "liana.cli.benchmark:main"
+liana_apply = "liana.cli.apply:main"

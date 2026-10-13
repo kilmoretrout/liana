@@ -12,8 +12,8 @@ import statistics
 import scipy.stats as stats
 
 # Your local modules
-from layers import ConvGCNUNet
-from regressors import UNetRegressor
+from liana.models.layers import ConvGCNUNet
+from liana.models.regressors import UNetRegressor
 import pgml
 from popgenml.data.functions import distmat_to_tree 
 from popgenml.data import PGTreeSequence

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from dist_functions import PdistLorentz, tangent_to_lorentz
+from .dist_functions import PdistLorentz, tangent_to_lorentz
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -576,8 +576,6 @@ class ConvGCNBlock(nn.Module):
         
         return x
     
-from dist_functions import Pdist, PdistL2, PdistPoincare
-
 def to_tangent(x: ManifoldTensor, manifold) -> torch.Tensor:
     """
     Safely maps a ManifoldTensor to the tangent space at the origin.
