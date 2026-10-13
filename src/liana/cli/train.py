@@ -20,7 +20,7 @@ import pandas as pd
 # Custom Modules
 from popgenml.data.functions import flip
 import pgml
-from layers import ConvGCNUNet
+from liana.models.layers import ConvGCNUNet
 
 import warnings
 # Suppress msprime spam
