@@ -23,6 +23,7 @@ import pgml
 from liana.models.layers import ConvGCNUNet
 import lmdb
 import zlib
+import pickle
 
 import warnings
 # Suppress msprime spam
@@ -47,8 +48,8 @@ def parse_args():
     parser.add_argument("--n_batch", default=3, type=int)
     parser.add_argument("--dilation", default=0., type = float)
     
-    parser.add_argument("--embed_dim", type=int, default=64, help="Embedding dimension for ConvGCNUNet")
-    parser.add_argument("--k", type=int, default=16, help="K value for the graph / kNN")
+    parser.add_argument("--embed_dim", type=int, default=32, help="Embedding dimension for ConvGCNUNet")
+    parser.add_argument("--k", type=int, default=11, help="K value for the graph / kNN")
     
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for Adam optimizer")
     parser.add_argument("--epochs", type=int, default=100, help="Total number of training epochs")
@@ -65,7 +66,7 @@ def parse_args():
     parser.add_argument("--masks", default = "None")
     parser.add_argument("--rec", action = "store_true")
                             
-    parser.add_argument("--dist", default="l2")
+    parser.add_argument("--dist", default="lorentz")
     parser.add_argument("--odir", default="None")
     args = parser.parse_args()
 
