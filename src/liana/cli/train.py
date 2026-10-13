@@ -489,9 +489,9 @@ def main():
     
     # 3. Instantiate the datasets
     train_dataset = DiskWaveletDataset(args, train_files, n = args.n, two_pop = args.two_pop, dilation = args.dilation, L = args.L, 
-                                       mask_folder = masks, return_rec_dist = args.rec)
+                                       mask_folder = masks)
     val_dataset = DiskWaveletDataset(args, val_files, n = args.n, two_pop = args.two_pop, dilation = args.dilation, 
-                                     L = args.L, mask_folder = masks, return_rec_dist = args.rec)
+                                     L = args.L, mask_folder = masks)
 
     train_loader = DataLoader(
         train_dataset,
