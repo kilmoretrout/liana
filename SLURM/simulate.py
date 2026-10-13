@@ -11,7 +11,7 @@ def parse_args():
     # Environment arguments
     parser.add_argument("--python_exec", default=sys.executable, 
                         help="Path to the Python executable (defaults to current env).")
-    parser.add_argument("--simulate_script", default="python/simulate.py", 
+    parser.add_argument("--simulate_script", default="src/liana/cli/simulate.py", 
                         help="Path to the simulator script.")
     
     # SLURM arguments
