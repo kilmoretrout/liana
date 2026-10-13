@@ -22,6 +22,7 @@ from popgenml.data.functions import flip
 import pgml
 from liana.models.layers import ConvGCNUNet
 import lmdb
+import zlib
 
 import warnings
 # Suppress msprime spam
