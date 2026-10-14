@@ -135,7 +135,7 @@ def summarize_results(csv_path: str, run_relate: bool, run_singer: bool):
     print("="*80)
     
     # Header
-    header = f"{'Metric':<20} | {'Custom vs. Relate':<20} | {'Custom vs. Singer':<20}"
+    header = f"{'Metric':<20} | {'Liana vs. Relate':<20} | {'Liana vs. Singer':<20}"
     print(header)
     print("-" * len(header))
     
