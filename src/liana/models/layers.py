@@ -5,6 +5,59 @@ import torch.nn.functional as F
 import math
 from .dist_functions import PdistLorentz, tangent_to_lorentz
 
+class SMCAwareLoss(nn.Module):
+    def __init__(self, num_leaves, beta=10.0, lambda_spr=0.5, gamma_tree=1.0):
+        super().__init__()
+        self.num_leaves = num_leaves
+        self.lambda_spr = lambda_spr
+        self.gamma_tree = gamma_tree
+        
+        self.tropical = TropicalSpace(beta=beta)
+        self.four_point = FourPointRegularizer(num_leaves)
+        
+    def forward(self, pred_condensed, target_condensed, scale_factor=1.0):
+        # 1. Base Supervised Loss (Your existing loss)
+        loss_l1 = F.smooth_l1_loss(pred_condensed, target_condensed)
+        
+        # 2. Unpack to symmetric matrices for geometric constraints
+        D_pred_sym = condensed_to_symmetric(pred_condensed, self.num_leaves, scale_factor)
+        
+        batch_size, num_sites, _, _ = D_pred_sym.shape
+        
+        # 3. Enforce valid phylogenies at every site (Tree-ness)
+        # Flatten batch and sites to compute all 4-point conditions in one vectorized pass
+        D_flat = D_pred_sym.view(batch_size * num_sites, self.num_leaves, self.num_leaves)
+        tree_penalty = self.four_point(D_flat) / (batch_size * num_sites)
+        
+        # 4. Enforce SMC' SPR transitions (Tropical TV)
+        spr_penalty = smc_recombination_penalty(D_pred_sym, self.tropical)
+        
+        # 5. Combined Loss
+        total_loss = loss_l1 + (self.gamma_tree * tree_penalty) + (self.lambda_spr * spr_penalty)
+        
+        return total_loss, {
+            "smooth_l1": loss_l1.item(),
+            "four_point_penalty": tree_penalty.item(),
+            "spr_penalty": spr_penalty.item()
+        }
+
+class TropicalSpace:
+    def __init__(self, beta=10.0):
+        """
+        beta: The inverse temperature parameter. 
+        As beta -> infinity, soft addition becomes hard tropical max/min.
+        """
+        self.beta = beta
+
+    def tropical_distance(self, D1, D2):
+        """
+        Differentiable tropical distance between two distance matrices.
+        Approximates the L-infinity norm (max difference) using soft-maximum.
+        """
+        diff = torch.abs(D1 - D2)
+        # Softmax over all elements to approximate the infinity norm
+        return (1.0 / self.beta) * torch.logsumexp(self.beta * diff, dim=[-2, -1])
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()

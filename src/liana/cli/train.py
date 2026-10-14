@@ -20,7 +20,7 @@ import pandas as pd
 # Custom Modules
 from popgenml.data.functions import flip
 import pgml
-from liana.models.layers import ConvGCNUNet
+from liana.models.layers import ConvGCNUNet, SMCAwareLoss
 import lmdb
 import zlib
 import pickle
@@ -89,6 +89,16 @@ def worker_init_fn(worker_id):
     worker_seed = (torch.initial_seed() + global_rank) % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+    
+def get_annealed_beta(epoch, total_epochs, beta_start=1.0, beta_end=50.0):
+    """
+    Calculates the exponentially annealed beta for the current epoch.
+    """
+    # Clamp epoch to total_epochs to hold beta_end if training extends
+    current_step = min(epoch, total_epochs)
+    
+    decay_factor = math.pow(beta_end / beta_start, current_step / total_epochs)
+    return beta_start * decay_factor
 
 # ==========================================
 # DATASET & STATS
@@ -570,13 +580,16 @@ def main():
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
     
-    # 4. Optimizer Setup
-    if args.dist != 'poincare':
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    else:
-        optimizer = RiemannianAdam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_epochs, eta_min=1e-5
+    )
     
-    criterion = nn.SmoothL1Loss()
+    
+
+    beta_start = 1.0
+    beta_end = 50.0
+    criterion = SMCAwareLossSMCAwareLoss(num_leaves=args.n * 2, beta=beta_start)    
     
     result = {'loss': [], 'time': [], 'epoch': [], 'val_loss' : []}
     batches_per_epoch = 2500 * args.n_batch
@@ -587,6 +600,8 @@ def main():
     
     # 5. Training Loop
     for epoch in range(1, args.epochs + 1):
+        current_beta = get_annealed_beta(epoch, total_epochs, beta_start, beta_end)
+        loss_fn.tropical.beta = current_beta
     
         # ===============================
         #       TRAINING PHASE
@@ -706,6 +721,8 @@ def main():
                     logging.info(f"--> Loss improved. Saved checkpoint to {save_path}")
     
             logging.info(f"Epoch [{epoch:03d}/{args.epochs:03d}] | Train Loss: {epoch_train_loss:.6f} | Val Loss: {epoch_val_loss:.6f} | time: {result['time'][-1]:3f}")
+            scheduler.step()
+            
     if is_distributed:
         dist.destroy_process_group()
 
