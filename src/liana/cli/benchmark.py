@@ -256,7 +256,9 @@ def main():
                     
                     if hasattr(args, 'n') and args.n is not None and args.n < n_diploids_total:
                         paired_indices = np.array([[2*u, 2*u + 1] for u in range(n_diploids_total)], dtype=np.int32)
-                        n = 2 * args.n
+                        n = args.n
+                        total_pairs = x.shape[0] // 2
+                        
                         if args.two_pop:
                             half_n = n // 2
                             mid = total_pairs // 2
