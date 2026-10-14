@@ -86,6 +86,7 @@ def main():
             "sbatch",
             f"--mem={args.mem}",
             "-t", args.time,
+            "-o", os.path.join(args.odir, "{}.out".format(job_id)),
             "--wrap", python_cmd
         ]
         
