@@ -59,6 +59,7 @@ def parse_args():
     
     # Custom Model Arguments 
     parser.add_argument("-w", "--weights", default="models/n16_k11_cheby/best_model.pth", help="Path to PyTorch weights")
+    parser.add_argument("--two_pop", action = "store_true", help = "For two-pop data.  Assumes the same number of haploids in each population when downsampling to 2*n haploids")
     
     args = parser.parse_args()
     
@@ -255,7 +256,17 @@ def main():
                     
                     if hasattr(args, 'n') and args.n is not None and args.n < n_diploids_total:
                         paired_indices = np.array([[2*u, 2*u + 1] for u in range(n_diploids_total)], dtype=np.int32)
-                        selected_pairs = paired_indices[:args.n]
+                        if args.two_pop:
+                            half_n = n // 2
+                            mid = total_pairs // 2
+                            first_half = paired_indices[:mid]
+                            last_half = paired_indices[mid:]
+                            
+                            # Take n // 2 pairs from the first half and n // 2 from the last half
+                            selected_pairs = np.vstack((first_half[:half_n], last_half[:half_n]))
+                        else:
+                            selected_pairs = paired_indices[:n]
+      
                         ii = np.sort(selected_pairs.flatten())
                         
                         x = x[ii, :]
