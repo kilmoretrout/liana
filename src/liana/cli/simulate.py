@@ -33,7 +33,8 @@ def parse_args():
     parser.add_argument("--odir", default = "None")
     
     # <-- Added job_id to prevent key collisions on a cluster
-    parser.add_argument("--job_id", default = 0, type = int, help="Global job ID for LMDB keys") 
+    parser.add_argument("--job_id", default = 0, type = int, help="Global job ID for LMDB keys")
+    parser.add_argument("--eval", action = "store_true")
     
     args = parser.parse_args()
 
@@ -60,9 +61,7 @@ def main():
         sim = DiscoalSimulator(args.ifile)
     # number of haploids
     n = 2 * sim.samples['pop1']['n']
-    
-    # --- Open LMDB Environment ---
-    # map_size is the virtual memory limit (1TB here). It will be a sparse file on Linux.
+
     db_path = os.path.join(args.odir, f'simulations_{args.job_id}.lmdb')
     env = lmdb.open(db_path, map_size=1099511627776)
     
@@ -112,8 +111,6 @@ def main():
         print('have {} trees...'.format(Ds.shape[0]))
         sys.stdout.flush()
         
-        # --- Package and Write to LMDB ---
-        # 1. Package all the arrays into a single dictionary
         data_dict = {
             'x': ret['x'].astype(np.uint8),
             'intervals': np.array(intervals),
@@ -121,14 +118,12 @@ def main():
             'coal': np.array(coal_times, dtype = np.float32),
             'D': Ds,
             'params': sim.params,
-            'ts' : ts
         }
+        if args.eval:
+            data_dict['ts'] = ts
         
-        # 2. Serialize to bytes using fastest C-pickler protocol available
-        # Serialize to bytes using fastest C-pickler protocol available
         byte_data = pickle.dumps(data_dict, protocol=-1)
         
-        # Compress the bytes (level 3 is a great balance of speed vs compression)
         compressed_data = zlib.compress(byte_data, level=3)
         
         key = f"{args.job_id:08d}_{ix:08d}".encode('ascii')
