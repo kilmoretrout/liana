@@ -588,7 +588,7 @@ def main():
         optimizer = RiemannianAdam(model.parameters(), lr=args.lr)
     
     criterion = nn.SmoothL1Loss()
-    smc_criterion = UnsupervisedSMCLoss(args.n * 2)
+    smc_criterion = UnsupervisedSMCLoss(args.n * 2).to(device)
     
     result = {'loss': [], 'time': [], 'epoch': [], 'val_loss' : []}
     batches_per_epoch = 2500 * args.n_batch
