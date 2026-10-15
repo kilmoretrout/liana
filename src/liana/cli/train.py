@@ -626,7 +626,7 @@ def main():
             interval_samples += inputs.size(0)
             
             loss = loss / args.n_batch
-            smc_loss = smc_criterion(outputs, targets)
+            smc_loss, _ = smc_criterion(outputs, targets)
             
             loss += smc_loss / args.n_batch
             
