@@ -350,18 +350,10 @@ class DiskWaveletDataset(IterableDataset):
                 X_tensor = torch.from_numpy(X_chunk_np).float()
                 D_tensor = torch.from_numpy(D_chunk_np).float()
                 
-                seq_chunk_np = x[:, ii:ii + self.args.size]
-                seq_tensor = torch.from_numpy(seq_chunk_np).float()
-                
-                # Transpose to match Felsenstein expectation: (num_sites, num_leaves)
-                seq_tensor = seq_tensor.transpose(0, 1)
-                
-                # Create biallelic one-hot encoding: 0 -> [1, 0], 1 -> [0, 1]
-                # Shape becomes: (num_sites, num_leaves, 2)
-                seq_one_hot = torch.stack([1.0 - seq_tensor, seq_tensor], dim=-1)
-                
-                # --- 3. Apply Internal Normalization ---
+                # Apply Internal Normalization
                 if self.mean_x is not None and len(self.scales) > 0:
+                    
+            
                     mean_x_view = self.mean_x.view(-1, 1, 1)
                     std_x_view = self.std_x.view(-1, 1, 1)
                     
@@ -377,8 +369,7 @@ class DiskWaveletDataset(IterableDataset):
                         D_tensor
                     )
 
-                # Yield the sequences alongside the features and targets
-                yield X_tensor, D_tensor + self.dilation, seq_one_hot
+                yield X_tensor, D_tensor + self.dilation
             
             
                 
@@ -397,7 +388,7 @@ def compute_dataset_stats(dataloader, num_batches=100, factor = 2.):
     if global_rank == 0:
         logging.info(f"Estimating stats over {num_batches} batches...")
     
-    for i, (X_batch, Y_batch, _) in enumerate(dataloader):
+    for i, (X_batch, Y_batch) in enumerate(dataloader):
         if i >= num_batches: break
             
         # X Stats
@@ -588,7 +579,6 @@ def main():
         optimizer = RiemannianAdam(model.parameters(), lr=args.lr)
     
     criterion = nn.SmoothL1Loss()
-    smc_criterion = UnsupervisedSMCLoss(args.n * 2).to(device)
     
     result = {'loss': [], 'time': [], 'epoch': [], 'val_loss' : []}
     batches_per_epoch = 2500 * args.n_batch
@@ -617,14 +607,14 @@ def main():
         # You can add this to your args, defaulting to 100 here if it's missing
         log_interval = getattr(args, 'log_interval', 100)
         
-        for batch_idx, (inputs, targets, xs) in enumerate(train_loader):
-            inputs, targets, xs = inputs.to(device), targets.to(device), xs.to(device)
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
             
             outputs, _ = model(inputs)
             
             # Mask out -infs for the loss calculation
             valid_mask = torch.isfinite(targets)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs[valid_mask], targets[valid_mask])
         
             # Track losses
             batch_loss = loss.item() * inputs.size(0)
@@ -635,10 +625,6 @@ def main():
             interval_samples += inputs.size(0)
             
             loss = loss / args.n_batch
-            smc_loss, _ = smc_criterion(outputs, xs)
-            
-            loss += smc_loss / args.n_batch
-            
             loss.backward()
         
             if (batch_idx + 1) % args.n_batch == 0 or (batch_idx + 1) == batches_per_epoch:
@@ -679,7 +665,7 @@ def main():
         # Pull a finite chunk for validation
         
         with torch.no_grad():
-            for inputs, targets, _ in val_loader:
+            for inputs, targets in val_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
                 outputs, _ = model(inputs)
