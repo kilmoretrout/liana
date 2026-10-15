@@ -274,7 +274,7 @@ class UnsupervisedSMCLoss(nn.Module):
         tree_penalty = self.ultrametric(D_flat) / (batch_size * num_sites)
         
         # Enforces the SMC' prior across the entire contiguous block
-        spr_penalty = smc_recombination_penalty(D_sym, self.tropical)
+        # spr_penalty = smc_recombination_penalty(D_sym, self.tropical)
         
         # ---------------------------------------------------------
         # 2. Stochastic Biallelic Likelihood (Computed on subset of sites)
@@ -302,7 +302,7 @@ class UnsupervisedSMCLoss(nn.Module):
         avg_nll = total_nll / (batch_size * actual_samples)
         
         # Combine Loss
-        loss = avg_nll + (self.gamma_tree * tree_penalty) + (self.lambda_spr * spr_penalty)
+        loss = avg_nll + (self.gamma_tree * tree_penalty)
         
         return loss, {"nll": avg_nll.item(), "tree": tree_penalty.item(), "spr": spr_penalty.item()}
 
