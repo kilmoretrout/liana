@@ -271,7 +271,7 @@ class UnsupervisedSMCLoss(nn.Module):
         # 1. Geometric Penalties
         D_flat = D_sym.view(batch_size * num_sites, self.num_leaves, self.num_leaves)
         tree_penalty = self.four_point(D_flat) / (batch_size * num_sites)
-        spr_penalty = smc_recombination_penalty(D_sym, self.tropical)
+        #spr_penalty = smc_recombination_penalty(D_sym, self.tropical)
         
         # 2. Biallelic Likelihood
         total_nll = 0.0
@@ -286,7 +286,7 @@ class UnsupervisedSMCLoss(nn.Module):
                 total_nll -= log_likelihood
                 
         avg_nll = total_nll / (batch_size * num_sites)
-        loss = avg_nll + (self.gamma_tree * tree_penalty) + (self.lambda_spr * spr_penalty)
+        loss = avg_nll + (self.gamma_tree * tree_penalty)
         
         return loss, {"nll": avg_nll.item(), "tree": tree_penalty.item(), "spr": spr_penalty.item()}
 
