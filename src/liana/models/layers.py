@@ -251,42 +251,58 @@ class UnsupervisedSMCLoss(nn.Module):
         self.tau_nj = tau_nj
         
         self.tropical = TropicalSpace(beta=beta)
-        self.four_point = UltrametricRegularizer(num_leaves)
-        self.soft_nj = DifferentiableUPGMA(num_leaves)
+        self.ultrametric = UltrametricRegularizer(num_leaves) # Using UPGMA constraint
+        self.soft_upgma = DifferentiableUPGMA(num_leaves)
         
-        # Inject the Biallelic Felsenstein
         self.felsenstein = BiallelicDifferentiableFelsenstein(
             num_leaves=num_leaves, 
             num_internal=num_leaves - 1
         )
         
-    def forward(self, pred_log_condensed, sequence_data, scale_factor=1.0):
+    def forward(self, pred_log_condensed, sequence_data, scale_factor=1.0, num_samples=10):
         """
-        pred_log_condensed: (batch_size, num_sites, condensed_dim)
-        sequence_data: (batch_size, num_sites, num_leaves, 2) <--- Biallelic Input
+        num_samples: How many sites per sequence to randomly sample for the Felsenstein loss.
+                     Lower this number until it fits in your GPU VRAM (e.g., 5 or 10).
         """
         batch_size, num_sites, _ = pred_log_condensed.shape
         D_sym = condensed_to_symmetric(pred_log_condensed, self.num_leaves, scale_factor)
         
-        # 1. Geometric Penalties
+        # ---------------------------------------------------------
+        # 1. Geometric Penalties (Computed on ALL sites - very cheap)
+        # ---------------------------------------------------------
         D_flat = D_sym.view(batch_size * num_sites, self.num_leaves, self.num_leaves)
-        tree_penalty = self.four_point(D_flat) / (batch_size * num_sites)
-        #spr_penalty = smc_recombination_penalty(D_sym, self.tropical)
+        tree_penalty = self.ultrametric(D_flat) / (batch_size * num_sites)
         
-        # 2. Biallelic Likelihood
+        # Enforces the SMC' prior across the entire contiguous block
+        spr_penalty = smc_recombination_penalty(D_sym, self.tropical)
+        
+        # ---------------------------------------------------------
+        # 2. Stochastic Biallelic Likelihood (Computed on subset of sites)
+        # ---------------------------------------------------------
         total_nll = 0.0
+        
+        # Ensure we don't ask for more samples than sites available
+        actual_samples = min(num_samples, num_sites)
+        
         for b in range(batch_size):
-            for s in range(num_sites):
-                postorder_edges, branch_lengths = self.soft_nj(D_sym[b, s], tau=self.tau_nj)
+            # Randomly select a subset of sites for this batch element
+            sampled_indices = torch.randperm(num_sites, device=D_sym.device)[:actual_samples]
+            
+            for s in sampled_indices:
+                # 1. Differentiable routing on the sampled matrix
+                postorder_edges, branch_lengths = self.soft_upgma(D_sym[b, s], tau=self.tau_nj)
                 
-                # Input shape matches Biallelic Felsenstein requirement: (num_leaves, 1, 2)
-                site_seq = sequence_data[b, s].unsqueeze(1)
+                # 2. Likelihood on the sampled genetic sequence
+                site_seq = sequence_data[b, s].unsqueeze(1) # Shape: (num_leaves, 1, 2)
                 log_likelihood = self.felsenstein(site_seq, postorder_edges, branch_lengths)
                 
                 total_nll -= log_likelihood
                 
-        avg_nll = total_nll / (batch_size * num_sites)
-        loss = avg_nll + (self.gamma_tree * tree_penalty)
+        # Average NLL over the exact number of sites we evaluated
+        avg_nll = total_nll / (batch_size * actual_samples)
+        
+        # Combine Loss
+        loss = avg_nll + (self.gamma_tree * tree_penalty) + (self.lambda_spr * spr_penalty)
         
         return loss, {"nll": avg_nll.item(), "tree": tree_penalty.item(), "spr": spr_penalty.item()}
 
