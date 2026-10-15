@@ -304,7 +304,7 @@ class UnsupervisedSMCLoss(nn.Module):
         # Combine Loss
         loss = avg_nll + (self.gamma_tree * tree_penalty)
         
-        return loss, {"nll": avg_nll.item(), "tree": tree_penalty.item(), "spr": spr_penalty.item()}
+        return loss, {"nll": avg_nll.item(), "tree": tree_penalty.item()}
 
 class TropicalSpace:
     def __init__(self, beta=10.0):
