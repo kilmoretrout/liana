@@ -5,41 +5,290 @@ import torch.nn.functional as F
 import math
 from .dist_functions import PdistLorentz, tangent_to_lorentz
 
-class SMCAwareLoss(nn.Module):
-    def __init__(self, num_leaves, beta=10.0, lambda_spr=0.5, gamma_tree=1.0):
+def condensed_to_symmetric(condensed_D, num_leaves, scale_factor=1.0):
+    """
+    Converts a batch of condensed scaled log matrices back to standard linear matrices.
+    condensed_D: (batch_size, num_sites, num_leaves * (num_leaves - 1) / 2)
+    """
+    batch_size, num_sites, _ = condensed_D.shape
+    
+    # 1. Reverse the scaling and the log
+    linear_D = torch.exp(condensed_D / scale_factor)
+    
+    # 2. Map the 1D condensed vector to a 2D symmetric matrix
+    # (PyTorch doesn't have a built-in squareform, so we build the indices)
+    D_sym = torch.zeros((batch_size, num_sites, num_leaves, num_leaves), device=condensed_D.device)
+    
+    triu_indices = torch.triu_indices(num_leaves, num_leaves, offset=1)
+    D_sym[:, :, triu_indices[0], triu_indices[1]] = linear_D
+    D_sym[:, :, triu_indices[1], triu_indices[0]] = linear_D  # Mirror for symmetry
+    
+    return D_sym
+
+import torch
+import torch.nn as nn
+
+import itertools
+
+class UltrametricRegularizer(nn.Module):
+    def __init__(self, num_leaves):
+        super().__init__()
+        # Precompute all O(N^3) triplets
+        triplets = list(itertools.combinations(range(num_leaves), 3))
+        self.triplets = torch.tensor(triplets, dtype=torch.long)
+        
+    def forward(self, D):
+        """
+        D: Tensor of shape (..., N, N)
+        """
+        i = self.triplets[:, 0]
+        j = self.triplets[:, 1]
+        k = self.triplets[:, 2]
+        
+        # Extract the three distances for all triplets
+        D1 = D[..., i, j]
+        D2 = D[..., j, k]
+        D3 = D[..., i, k]
+        
+        S = torch.stack([D1, D2, D3], dim=-1)
+        
+        # Find the two largest distances
+        top2 = torch.topk(S, k=2, dim=-1).values
+        
+        # Penalize any deviation between the absolute max and the second max
+        penalty = torch.sum(torch.abs(top2[..., 0] - top2[..., 1]))
+        return penalty
+    
+class DifferentiableUPGMA(nn.Module):
+    def __init__(self, num_leaves):
+        super().__init__()
+        self.num_leaves = num_leaves
+        self.num_total_nodes = 2 * num_leaves - 1
+        
+    def forward(self, D, tau=0.1):
+        device = D.device
+        N = self.num_leaves
+        
+        # Initialize padded distance matrix
+        D_full = torch.zeros((self.num_total_nodes, self.num_total_nodes), device=device)
+        D_full[:N, :N] = D
+        
+        active_mask = torch.zeros(self.num_total_nodes, device=device)
+        active_mask[:N] = 1.0
+        
+        # UPGMA requires tracking node heights and cluster sizes
+        heights = torch.zeros(self.num_total_nodes, device=device)
+        sizes = torch.ones(self.num_total_nodes, device=device)
+        
+        postorder_edges = []
+        branch_lengths = []
+        
+        # Pre-compute upper triangle indices once
+        triu_idx = torch.triu_indices(self.num_total_nodes, self.num_total_nodes, offset=1)
+        
+        for step in range(N - 1):
+            # 1. Mask invalid connections
+            valid_mask = active_mask.unsqueeze(1) * active_mask.unsqueeze(0)
+            valid_mask.fill_diagonal_(0)
+            
+            # Use infinity so inactive pairs are never chosen by argmin
+            D_masked = torch.where(valid_mask > 0, D_full, torch.tensor(float('inf'), device=device))
+            
+            # 2. Extract valid pairwise distances
+            D_flat = D_masked[triu_idx[0], triu_idx[1]]
+            
+            # 3. Softmax Routing (STE) on standard distances
+            W_flat = F.softmax(-D_flat / tau, dim=0)
+            
+            idx = torch.argmin(D_flat)
+            hard_one_hot = torch.zeros_like(W_flat)
+            hard_one_hot[idx] = 1.0
+            
+            P_flat = hard_one_hot + W_flat - W_flat.detach()
+            
+            # Selected node indices
+            i_idx = triu_idx[0][idx]
+            j_idx = triu_idx[1][idx]
+            u = N + step
+            
+            # 4. Differentiable Branch Lengths
+            # In UPGMA, parent height is half the distance between clusters
+            H_new = torch.sum(P_flat * 0.5 * D_flat)
+            
+            H_i_all = heights[triu_idx[0]]
+            H_j_all = heights[triu_idx[1]]
+            
+            # Branch length = Height(parent) - Height(child)
+            len_i = torch.sum(P_flat * (0.5 * D_flat - H_i_all))
+            len_j = torch.sum(P_flat * (0.5 * D_flat - H_j_all))
+            
+            len_i = torch.clamp(len_i, min=1e-6)
+            len_j = torch.clamp(len_j, min=1e-6)
+            
+            postorder_edges.extend([(u, i_idx.item()), (u, j_idx.item())])
+            branch_lengths.extend([len_i, len_j])
+            
+            # 5. Arithmetic Mean Distance Update
+            # D_uk = (|i|D_ik + |j|D_jk) / (|i| + |j|)
+            Size_i = sizes[triu_idx[0]]
+            Size_j = sizes[triu_idx[1]]
+            total_size = Size_i + Size_j
+            
+            D_i_m = D_full[triu_idx[0], :]
+            D_j_m = D_full[triu_idx[1], :]
+            
+            weighted_sum = (Size_i.unsqueeze(1) * D_i_m) + (Size_j.unsqueeze(1) * D_j_m)
+            mean_distances = weighted_sum / total_size.unsqueeze(1)
+            
+            # Differentiably collapse the topology choices
+            new_distances = torch.sum(P_flat.unsqueeze(1) * mean_distances, dim=0)
+            
+            # 6. Update Graph State
+            D_full[u, :] = new_distances
+            D_full[:, u] = new_distances
+            D_full[u, u] = 0.0
+            
+            # Keep heights in the autograd graph for subsequent branch lengths
+            heights[u] = H_new 
+            sizes[u] = sizes[i_idx] + sizes[j_idx]
+            
+            active_mask[u] = 1.0
+            active_mask[i_idx] = 0.0
+            active_mask[j_idx] = 0.0
+            
+        return postorder_edges, torch.stack(branch_lengths)
+
+class BiallelicSubstitutionModel(nn.Module):
+    def __init__(self, mutation_rate=1.0):
+        super().__init__()
+        # CFN Model: Symmetric transition rates between 0 and 1
+        # Rows must sum to 0.
+        Q_matrix = torch.tensor([
+            [-mutation_rate,  mutation_rate],
+            [ mutation_rate, -mutation_rate]
+        ], dtype=torch.float32)
+        
+        self.register_buffer('Q', Q_matrix)
+        
+    def forward(self, branch_lengths):
+        """
+        branch_lengths: Tensor of shape (num_edges,)
+        Returns log transition probability matrices of shape (num_edges, 2, 2)
+        """
+        # Shape: (num_edges, 1, 1) * (1, 2, 2)
+        Qt = branch_lengths.view(-1, 1, 1) * self.Q.unsqueeze(0)
+        
+        # Matrix exponential for 2x2 tensors
+        P = torch.linalg.matrix_exp(Qt)
+        
+        return torch.log(torch.clamp(P, min=1e-12))
+
+class BiallelicDifferentiableFelsenstein(nn.Module):
+    def __init__(self, num_leaves, num_internal, base_freqs=None):
+        super().__init__()
+        self.num_nodes = num_leaves + num_internal
+        self.sub_model = BiallelicSubstitutionModel()
+        
+        # Default to uniform base frequencies [0.5, 0.5] if none provided
+        if base_freqs is None:
+            base_freqs = torch.tensor([0.5, 0.5], dtype=torch.float32)
+        self.register_buffer('log_pi', torch.log(base_freqs))
+        
+    def forward(self, leaf_sequences, postorder_edges, branch_lengths):
+        """
+        leaf_sequences: (num_leaves, num_sites, 2) One-hot or prob encoded (0/1).
+        postorder_edges: List of tuples (parent_id, child_id).
+        branch_lengths: Tensor of shape (num_edges,).
+        """
+        num_sites = leaf_sequences.shape[1]
+        
+        # Initialize log partial likelihoods for all nodes -> Size 2
+        log_L = torch.full((self.num_nodes, num_sites, 2), -float('inf'), 
+                           device=leaf_sequences.device)
+        
+        # Populate leaves
+        log_L[:leaf_sequences.shape[0]] = torch.log(torch.clamp(leaf_sequences, min=1e-12))
+        
+        # Get log transition matrices: (num_edges, 2, 2)
+        log_P_all = self.sub_model(branch_lengths)
+        
+        log_internal_acc = torch.zeros(
+            (self.num_nodes, num_sites, 2), device=leaf_sequences.device
+        )
+        
+        # Pruning Loop (Message Passing)
+        for edge_idx, (parent, child) in enumerate(postorder_edges):
+            log_P = log_P_all[edge_idx]   # (2, 2)
+            log_Lc = log_L[child]         # (num_sites, 2)
+            
+            # Broadcast to (num_sites, 2_parent, 2_child)
+            log_P_expanded = log_P.unsqueeze(0)
+            log_Lc_expanded = log_Lc.unsqueeze(1)
+            
+            # Marginalize out the child states
+            log_message = torch.logsumexp(log_P_expanded + log_Lc_expanded, dim=2)
+            
+            # Accumulate at parent
+            log_internal_acc[parent] += log_message
+            log_L[parent] = log_internal_acc[parent]
+            
+        root_idx = postorder_edges[-1][0]
+        
+        # Incorporate base frequencies at the root
+        root_log_L = log_L[root_idx] + self.log_pi.unsqueeze(0)
+        
+        # Marginalize out the root states to get the log likelihood per site
+        site_log_likelihoods = torch.logsumexp(root_log_L, dim=1)
+        
+        return torch.sum(site_log_likelihoods)
+    
+class UnsupervisedSMCLoss(nn.Module):
+    def __init__(self, num_leaves, beta=10.0, tau_nj=0.1, lambda_spr=0.5, gamma_tree=1.0):
         super().__init__()
         self.num_leaves = num_leaves
         self.lambda_spr = lambda_spr
         self.gamma_tree = gamma_tree
+        self.tau_nj = tau_nj
         
         self.tropical = TropicalSpace(beta=beta)
-        self.four_point = FourPointRegularizer(num_leaves)
+        self.four_point = UltrametricRegularizer(num_leaves)
+        self.soft_nj = DifferentiableUPGMA(num_leaves)
         
-    def forward(self, pred_condensed, target_condensed, scale_factor=1.0):
-        # 1. Base Supervised Loss (Your existing loss)
-        loss_l1 = F.smooth_l1_loss(pred_condensed, target_condensed)
+        # Inject the Biallelic Felsenstein
+        self.felsenstein = BiallelicDifferentiableFelsenstein(
+            num_leaves=num_leaves, 
+            num_internal=num_leaves - 1
+        )
         
-        # 2. Unpack to symmetric matrices for geometric constraints
-        D_pred_sym = condensed_to_symmetric(pred_condensed, self.num_leaves, scale_factor)
+    def forward(self, pred_log_condensed, sequence_data, scale_factor=1.0):
+        """
+        pred_log_condensed: (batch_size, num_sites, condensed_dim)
+        sequence_data: (batch_size, num_sites, num_leaves, 2) <--- Biallelic Input
+        """
+        batch_size, num_sites, _ = pred_log_condensed.shape
+        D_sym = condensed_to_symmetric(pred_log_condensed, self.num_leaves, scale_factor)
         
-        batch_size, num_sites, _, _ = D_pred_sym.shape
-        
-        # 3. Enforce valid phylogenies at every site (Tree-ness)
-        # Flatten batch and sites to compute all 4-point conditions in one vectorized pass
-        D_flat = D_pred_sym.view(batch_size * num_sites, self.num_leaves, self.num_leaves)
+        # 1. Geometric Penalties
+        D_flat = D_sym.view(batch_size * num_sites, self.num_leaves, self.num_leaves)
         tree_penalty = self.four_point(D_flat) / (batch_size * num_sites)
+        spr_penalty = smc_recombination_penalty(D_sym, self.tropical)
         
-        # 4. Enforce SMC' SPR transitions (Tropical TV)
-        spr_penalty = smc_recombination_penalty(D_pred_sym, self.tropical)
+        # 2. Biallelic Likelihood
+        total_nll = 0.0
+        for b in range(batch_size):
+            for s in range(num_sites):
+                postorder_edges, branch_lengths = self.soft_nj(D_sym[b, s], tau=self.tau_nj)
+                
+                # Input shape matches Biallelic Felsenstein requirement: (num_leaves, 1, 2)
+                site_seq = sequence_data[b, s].unsqueeze(1)
+                log_likelihood = self.felsenstein(site_seq, postorder_edges, branch_lengths)
+                
+                total_nll -= log_likelihood
+                
+        avg_nll = total_nll / (batch_size * num_sites)
+        loss = avg_nll + (self.gamma_tree * tree_penalty) + (self.lambda_spr * spr_penalty)
         
-        # 5. Combined Loss
-        total_loss = loss_l1 + (self.gamma_tree * tree_penalty) + (self.lambda_spr * spr_penalty)
-        
-        return total_loss, {
-            "smooth_l1": loss_l1.item(),
-            "four_point_penalty": tree_penalty.item(),
-            "spr_penalty": spr_penalty.item()
-        }
+        return loss, {"nll": avg_nll.item(), "tree": tree_penalty.item(), "spr": spr_penalty.item()}
 
 class TropicalSpace:
     def __init__(self, beta=10.0):
