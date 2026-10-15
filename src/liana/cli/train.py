@@ -350,10 +350,18 @@ class DiskWaveletDataset(IterableDataset):
                 X_tensor = torch.from_numpy(X_chunk_np).float()
                 D_tensor = torch.from_numpy(D_chunk_np).float()
                 
-                # Apply Internal Normalization
+                seq_chunk_np = x[:, ii:ii + self.args.size]
+                seq_tensor = torch.from_numpy(seq_chunk_np).float()
+                
+                # Transpose to match Felsenstein expectation: (num_sites, num_leaves)
+                seq_tensor = seq_tensor.transpose(0, 1)
+                
+                # Create biallelic one-hot encoding: 0 -> [1, 0], 1 -> [0, 1]
+                # Shape becomes: (num_sites, num_leaves, 2)
+                seq_one_hot = torch.stack([1.0 - seq_tensor, seq_tensor], dim=-1)
+                
+                # --- 3. Apply Internal Normalization ---
                 if self.mean_x is not None and len(self.scales) > 0:
-                    
-            
                     mean_x_view = self.mean_x.view(-1, 1, 1)
                     std_x_view = self.std_x.view(-1, 1, 1)
                     
@@ -369,7 +377,8 @@ class DiskWaveletDataset(IterableDataset):
                         D_tensor
                     )
 
-                yield X_tensor, D_tensor + self.dilation
+                # Yield the sequences alongside the features and targets
+                yield X_tensor, D_tensor + self.dilation, seq_one_hot
             
             
                 
@@ -609,7 +618,7 @@ def main():
         log_interval = getattr(args, 'log_interval', 100)
         
         for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets, xs = inputs.to(device), targets.to(device)
             
             outputs, _ = model(inputs)
             
@@ -626,7 +635,7 @@ def main():
             interval_samples += inputs.size(0)
             
             loss = loss / args.n_batch
-            smc_loss, _ = smc_criterion(outputs, targets)
+            smc_loss, _ = smc_criterion(outputs, xs)
             
             loss += smc_loss / args.n_batch
             
