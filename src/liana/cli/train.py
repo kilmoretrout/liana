@@ -397,7 +397,7 @@ def compute_dataset_stats(dataloader, num_batches=100, factor = 2.):
     if global_rank == 0:
         logging.info(f"Estimating stats over {num_batches} batches...")
     
-    for i, (X_batch, Y_batch) in enumerate(dataloader):
+    for i, (X_batch, Y_batch, _) in enumerate(dataloader):
         if i >= num_batches: break
             
         # X Stats
@@ -617,8 +617,8 @@ def main():
         # You can add this to your args, defaulting to 100 here if it's missing
         log_interval = getattr(args, 'log_interval', 100)
         
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs, targets, xs = inputs.to(device), targets.to(device)
+        for batch_idx, (inputs, targets, xs) in enumerate(train_loader):
+            inputs, targets, xs = inputs.to(device), targets.to(device), xs.to(device)
             
             outputs, _ = model(inputs)
             
@@ -679,7 +679,7 @@ def main():
         # Pull a finite chunk for validation
         
         with torch.no_grad():
-            for inputs, targets in val_loader:
+            for inputs, targets, _ in val_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
                 outputs, _ = model(inputs)
