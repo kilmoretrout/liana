@@ -129,7 +129,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using {device} for liana model inference")
     
-    log_mem("After initial setup")
+    #log_mem("After initial setup")
 
     # 2. Discover LMDBs
     lmdb_paths = sorted(find_lmdb_envs(args.input))
@@ -163,7 +163,7 @@ def main():
                 if args.n_samples is not None:
                     keys = keys[:args.n_samples]
                     
-                log_mem(f"Before DB loop ({len(keys)} keys loaded)")
+                #log_mem(f"Before DB loop ({len(keys)} keys loaded)")
 
                 for key in keys:
                     log_mem(f"Start of loop (Key: {key.decode('ascii')})")
@@ -180,7 +180,7 @@ def main():
                         logging.error(f"Failed to unpickle key {key_str}: {e}")
                         continue
                         
-                    log_mem(f"After unpickling data (Key: {key_str})")
+                    #log_mem(f"After unpickling data (Key: {key_str})")
 
                     x = data['x'].astype(np.float32)
                     pos = data['pos']
@@ -229,18 +229,18 @@ def main():
                         start_time = time.time()
                         ts_est_relate = relate(x.astype(np.uint8), pos, n_samples, mu, r, sim_L, None, diploid=True, verbose=False)
                         relate_time = time.time() - start_time
-                        log_mem(f"After Relate (Key: {key_str})")
+                        #log_mem(f"After Relate (Key: {key_str})")
                     
                     if run_singer:
                         start_time = time.time()
                         ts_est_singer = next(singer(x.astype(np.uint8), pos, mu, r, sim_L))
                         singer_time = time.time() - start_time
-                        log_mem(f"After Singer (Key: {key_str})")
+                        #log_mem(f"After Singer (Key: {key_str})")
                     
                     start_time = time.time()
                     ts_est_liana = liana(args.weights, x, pos, args.L, args.window_size, device_str='cuda')
                     pytorch_time = time.time() - start_time
-                    log_mem(f"After Liana (Key: {key_str})")
+                    #log_mem(f"After Liana (Key: {key_str})")
                     
                     row = {
                         'db_name': db_path.name,
@@ -291,7 +291,7 @@ def main():
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         
-                    log_mem(f"End of loop after cleanup (Key: {key_str})")
+                    #log_mem(f"End of loop after cleanup (Key: {key_str})")
             env.close()
             
     # summarize_results(args.output, run_relate, run_singer)
