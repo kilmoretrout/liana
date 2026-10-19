@@ -12,7 +12,7 @@ import io
 import logging
 import json
 import gc
-import psutil  # <--- Added for memory tracking
+import psutil
 from pathlib import Path
 from typing import List, Tuple, Optional
 from tqdm import tqdm
@@ -253,7 +253,7 @@ def main():
                         'liana_rms_log_coal': ts_est_liana.rms_log_coal_error(ts_true),
                         'liana_kl': ts_est_liana.symmetric_kl_divergence(ts_true),
                         'liana_chamfer': ts_est_liana.breakpoint_chamfer_distance(ts_true),
-                        'liana_ntrees': np.abs(len(ts_est_liana.trees) - len(ts_true.trees)),
+                        'liana_ntrees': np.abs(ts_est_liana.num_trees() - ts_true.num_trees()),
                     }
                     
                     if run_relate:
@@ -264,7 +264,7 @@ def main():
                             'relate_rms_log_coal': ts_est_relate.rms_log_coal_error(ts_true),
                             'relate_kl': ts_est_relate.symmetric_kl_divergence(ts_true),
                             'relate_chamfer': ts_est_relate.breakpoint_chamfer_distance(ts_true),
-                            'relate_ntrees': np.abs(len(ts_est_relate.trees) - len(ts_true.trees)),
+                            'relate_ntrees': np.abs(ts_est_relate.num_trees() - ts_true.num_trees()),
                         })
                         
                     if run_singer:
@@ -275,7 +275,7 @@ def main():
                             'singer_rms_log_coal': ts_est_singer.rms_log_coal_error(ts_true),
                             'singer_kl': ts_est_singer.symmetric_kl_divergence(ts_true),
                             'singer_chamfer': ts_est_singer.breakpoint_chamfer_distance(ts_true),
-                            'singer_ntrees': np.abs(len(ts_est_singer.trees) - len(ts_true.trees)),
+                            'singer_ntrees': np.abs(ts_est_singer.num_trees() - ts_true.num_trees()),
                         })
                         
                     writer.writerow(row)
