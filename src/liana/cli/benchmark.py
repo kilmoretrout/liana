@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("-o", "--output", type=str, required=True,
                         help="Path to save the benchmark results CSV.")
     parser.add_argument("--verbose", action="store_true", help="Print inference progress.")
+    parser.add_argument("--haploid", action="store_true", help="use if haploid data.")
     
     # Benchmarking Targets
     parser.add_argument("-b", "--bench_against", choices=['all', 'singer', 'relate'], default='all',
@@ -166,7 +167,7 @@ def main():
                 #log_mem(f"Before DB loop ({len(keys)} keys loaded)")
 
                 for key in keys:
-                    log_mem(f"Start of loop (Key: {key.decode('ascii')})")
+                    #log_mem(f"Start of loop (Key: {key.decode('ascii')})")
                     value = txn.get(key)
                     key_str = key.decode('ascii')
                     
@@ -227,7 +228,7 @@ def main():
                     
                     if run_relate:
                         start_time = time.time()
-                        ts_est_relate = relate(x.astype(np.uint8), pos, n_samples, mu, r, sim_L, None, diploid=True, verbose=False)
+                        ts_est_relate = relate(x.astype(np.uint8), pos, n_samples, mu, r, sim_L, None, diploid=(not args.haploid), verbose=False)
                         relate_time = time.time() - start_time
                         #log_mem(f"After Relate (Key: {key_str})")
                     
@@ -253,7 +254,7 @@ def main():
                         'liana_rms_log_coal': ts_est_liana.rms_log_coal_error(ts_true),
                         'liana_kl': ts_est_liana.symmetric_kl_divergence(ts_true),
                         'liana_chamfer': ts_est_liana.breakpoint_chamfer_distance(ts_true),
-                        'liana_ntrees': np.abs(ts_est_liana.num_trees() - ts_true.num_trees()),
+                        'liana_ntrees': np.abs(ts_est_liana.num_trees - ts_true.num_trees),
                     }
                     
                     if run_relate:
@@ -264,7 +265,7 @@ def main():
                             'relate_rms_log_coal': ts_est_relate.rms_log_coal_error(ts_true),
                             'relate_kl': ts_est_relate.symmetric_kl_divergence(ts_true),
                             'relate_chamfer': ts_est_relate.breakpoint_chamfer_distance(ts_true),
-                            'relate_ntrees': np.abs(ts_est_relate.num_trees() - ts_true.num_trees()),
+                            'relate_ntrees': np.abs(ts_est_relate.num_trees - ts_true.num_trees),
                         })
                         
                     if run_singer:
@@ -275,7 +276,7 @@ def main():
                             'singer_rms_log_coal': ts_est_singer.rms_log_coal_error(ts_true),
                             'singer_kl': ts_est_singer.symmetric_kl_divergence(ts_true),
                             'singer_chamfer': ts_est_singer.breakpoint_chamfer_distance(ts_true),
-                            'singer_ntrees': np.abs(ts_est_singer.num_trees() - ts_true.num_trees()),
+                            'singer_ntrees': np.abs(ts_est_singer.num_trees - ts_true.num_trees),
                         })
                         
                     writer.writerow(row)
