@@ -243,43 +243,48 @@ def main():
                     pytorch_time = time.time() - start_time
                     #log_mem(f"After Liana (Key: {key_str})")
                     
-                    row = {
-                        'db_name': db_path.name,
-                        'key': key_str,
-                        'N_est': round(N_est, 2),
-                        
-                        'liana_time': round(pytorch_time, 4),
-                        'liana_kc': ts_est_liana.kc_distance(ts_true),
-                        'liana_rf': ts_est_liana.rf_distance(ts_true),
-                        'liana_rms_log_coal': ts_est_liana.rms_log_coal_error(ts_true),
-                        'liana_kl': ts_est_liana.symmetric_kl_divergence(ts_true),
-                        'liana_chamfer': ts_est_liana.breakpoint_chamfer_distance(ts_true),
-                        'liana_ntrees': np.abs(ts_est_liana.num_trees - ts_true.num_trees),
-                    }
+                    try:
                     
-                    if run_relate:
-                        row.update({
-                            'relate_time': round(relate_time, 4),
-                            'relate_kc': ts_est_relate.kc_distance(ts_true),
-                            'relate_rf': ts_est_relate.rf_distance(ts_true),
-                            'relate_rms_log_coal': ts_est_relate.rms_log_coal_error(ts_true),
-                            'relate_kl': ts_est_relate.symmetric_kl_divergence(ts_true),
-                            'relate_chamfer': ts_est_relate.breakpoint_chamfer_distance(ts_true),
-                            'relate_ntrees': np.abs(ts_est_relate.num_trees - ts_true.num_trees),
-                        })
+                    
+                        row = {
+                            'db_name': db_path.name,
+                            'key': key_str,
+                            'N_est': round(N_est, 2),
+                            
+                            'liana_time': round(pytorch_time, 4),
+                            'liana_kc': ts_est_liana.kc_distance(ts_true),
+                            'liana_rf': ts_est_liana.rf_distance(ts_true),
+                            'liana_rms_log_coal': ts_est_liana.rms_log_coal_error(ts_true),
+                            'liana_kl': ts_est_liana.symmetric_kl_divergence(ts_true),
+                            'liana_chamfer': ts_est_liana.breakpoint_chamfer_distance(ts_true),
+                            'liana_ntrees': np.abs(ts_est_liana.num_trees - ts_true.num_trees),
+                        }
                         
-                    if run_singer:
-                        row.update({
-                            'singer_time': round(singer_time, 4),
-                            'singer_kc': ts_est_singer.kc_distance(ts_true),
-                            'singer_rf': ts_est_singer.rf_distance(ts_true),
-                            'singer_rms_log_coal': ts_est_singer.rms_log_coal_error(ts_true),
-                            'singer_kl': ts_est_singer.symmetric_kl_divergence(ts_true),
-                            'singer_chamfer': ts_est_singer.breakpoint_chamfer_distance(ts_true),
-                            'singer_ntrees': np.abs(ts_est_singer.num_trees - ts_true.num_trees),
-                        })
-                        
-                    writer.writerow(row)
+                        if run_relate:
+                            row.update({
+                                'relate_time': round(relate_time, 4),
+                                'relate_kc': ts_est_relate.kc_distance(ts_true),
+                                'relate_rf': ts_est_relate.rf_distance(ts_true),
+                                'relate_rms_log_coal': ts_est_relate.rms_log_coal_error(ts_true),
+                                'relate_kl': ts_est_relate.symmetric_kl_divergence(ts_true),
+                                'relate_chamfer': ts_est_relate.breakpoint_chamfer_distance(ts_true),
+                                'relate_ntrees': np.abs(ts_est_relate.num_trees - ts_true.num_trees),
+                            })
+                            
+                        if run_singer:
+                            row.update({
+                                'singer_time': round(singer_time, 4),
+                                'singer_kc': ts_est_singer.kc_distance(ts_true),
+                                'singer_rf': ts_est_singer.rf_distance(ts_true),
+                                'singer_rms_log_coal': ts_est_singer.rms_log_coal_error(ts_true),
+                                'singer_kl': ts_est_singer.symmetric_kl_divergence(ts_true),
+                                'singer_chamfer': ts_est_singer.breakpoint_chamfer_distance(ts_true),
+                                'singer_ntrees': np.abs(ts_est_singer.num_trees - ts_true.num_trees),
+                            })
+                            
+                        writer.writerow(row)
+                    except:
+                        pass
                     
                     # Cleanup variables to prevent memory leaks in the loop
                     del data, x, pos, ts_true
