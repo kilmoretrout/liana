@@ -30,7 +30,7 @@ class UNetRegressor(object):
         self.size = size
         self.stride = stride
         
-    def predict(self, x, pos, mask_channel=None):        
+    def predict(self, x, pos, mask_channel=None, batch_size=2):        
         start = 0
         end = self.size
         
@@ -40,7 +40,6 @@ class UNetRegressor(object):
         windows = []
         while end < x.shape[-1]:
             windows.append((start, end))
-            
             start += self.stride
             end += self.stride
             
@@ -58,24 +57,28 @@ class UNetRegressor(object):
             # Set the entire masked channel to 0 (the mean value post-normalization)
             x_input[mask_channel, :, :] = 0.0
 
-        for ix, window in enumerate(windows):                    
-            a, b = window
-            xw_window = x_input[:,:,a:b]
+        # BATCH PROCESSING
+        for i in range(0, len(windows), batch_size):
+            batch_windows = windows[i:i + batch_size]
             
-            xw_window = torch.FloatTensor(xw_window).to(self.device).unsqueeze(0)
+            # Stack the window slices into a single numpy array of shape (batch_size, channels, n_samples, window_size)
+            batch_data = np.stack([x_input[:, :, a:b] for a, b in batch_windows])
+            
+            # Transfer the whole batch to the GPU at once
+            batch_tensor = torch.FloatTensor(batch_data).to(self.device)
             
             with torch.no_grad():
-                D_pred_, xe = self.model(xw_window)
-                D_pred_ = D_pred_.detach().cpu().numpy()
+                D_pred_batch, _ = self.model(batch_tensor)
+                D_pred_batch = D_pred_batch.detach().cpu().numpy()
             
-            D_pred_ = D_pred_[0]
-            
-            D_pred[a:b] += np.exp(D_pred_ * self.std_y + self.mu_y)
-            count[a:b] += 1.
+            # Accumulate predictions back to their original positions
+            for j, (a, b) in enumerate(batch_windows):
+                D_pred[a:b] += np.exp(D_pred_batch[j] * self.std_y + self.mu_y)
+                count[a:b] += 1.
             
         # final distance prediction
         D_pred = D_pred / count
 
-        return D_pred        
+        return D_pred    
         
     
