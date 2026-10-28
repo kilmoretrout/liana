@@ -41,6 +41,14 @@ def parse_args():
 
     return args
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+        return super(NumpyEncoder, self).default(obj)
+
 def main():
     args = parse_args()
 
@@ -119,7 +127,7 @@ def main():
             sys.stdout.flush()
             
             # 3. Serialize parameters and eval objects
-            params_str = json.dumps(sim.params)
+            params_str = json.dumps(sim.params, cls=NumpyEncoder)
             ts_bytes = pickle.dumps(ts, protocol=-1) if args.eval else None
             
             # 4. Construct a single row as an Arrow RecordBatch
