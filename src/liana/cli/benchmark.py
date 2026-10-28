@@ -41,6 +41,7 @@ def parse_args():
                         help="Path to save the benchmark results CSV.")
     parser.add_argument("--verbose", action="store_true", help="Print inference progress.")
     parser.add_argument("--haploid", action="store_true", help="use if haploid data.")
+    parser.add_argument("--thin", default = 20, type = int)
     
     # Benchmarking Targets
     parser.add_argument("-b", "--bench_against", choices=['all', 'singer', 'relate'], default='all',
@@ -234,7 +235,7 @@ def main():
                     
                     if run_singer:
                         start_time = time.time()
-                        ts_est_singer = next(singer(x.astype(np.uint8), pos, mu, r, sim_L))
+                        ts_est_singer = next(singer(x.astype(np.uint8), pos, mu, r, sim_L, thin = args.thin))
                         singer_time = time.time() - start_time
                         #log_mem(f"After Singer (Key: {key_str})")
                     
