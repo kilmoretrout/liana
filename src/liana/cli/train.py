@@ -326,7 +326,9 @@ class DiskWaveletDataset(IterableDataset):
         
                 Y.extend([y[k] for u in range(len(ii_))])
 
-            Y = np.array(Y)            
+            Y = np.array(Y)
+
+            print(x.shape, Y.shape, y.shape)            
 
             # Apply original transformations
             x = flip(x)
