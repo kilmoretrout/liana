@@ -295,6 +295,7 @@ def main():
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     except Exception as e:
+                        print('Error in processing {}, key: {}...:'.format(db_path.name, key_str))
                         print(e)
                         pass
                         
