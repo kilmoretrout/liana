@@ -227,26 +227,22 @@ def main():
 
                     relate_time, singer_time, pytorch_time = 0.0, 0.0, 0.0
                     
-                    if run_relate:
-                        start_time = time.time()
-                        ts_est_relate = relate(x.astype(np.uint8), pos, n_samples, mu, r, sim_L, None, diploid=(not args.haploid), verbose=False)
-                        relate_time = time.time() - start_time
-                        #log_mem(f"After Relate (Key: {key_str})")
-                    
-                    if run_singer:
-                        start_time = time.time()
-                        ts_est_singer = next(singer(x.astype(np.uint8), pos, mu, r, sim_L, thin = args.thin))
-                        singer_time = time.time() - start_time
-                        #log_mem(f"After Singer (Key: {key_str})")
-                    
-                    start_time = time.time()
-                    ts_est_liana = liana(args.weights, x, pos, args.L, args.window_size, device_str='cuda')
-                    pytorch_time = time.time() - start_time
-                    #log_mem(f"After Liana (Key: {key_str})")
-                    
                     try:
-                    
-                    
+                        if run_relate:
+                            start_time = time.time()
+                            ts_est_relate = relate(x.astype(np.uint8), pos, n_samples, mu, r, sim_L, None, diploid=(not args.haploid), verbose=False)
+                            relate_time = time.time() - start_time
+                
+                        
+                        if run_singer:
+                            start_time = time.time()
+                            ts_est_singer = next(singer(x.astype(np.uint8), pos, mu, r, sim_L, thin = args.thin))
+                            singer_time = time.time() - start_time
+                        
+                        start_time = time.time()
+                        ts_est_liana = liana(args.weights, x, pos, args.L, args.window_size, device_str='cuda')
+                        pytorch_time = time.time() - start_time
+                        
                         row = {
                             'db_name': db_path.name,
                             'key': key_str,
@@ -284,24 +280,27 @@ def main():
                             })
                             
                         writer.writerow(row)
-                    except:
-                        pass
-                    
-                    # Cleanup variables to prevent memory leaks in the loop
-                    del data, x, pos, ts_true
-                    if run_relate: del ts_est_relate
-                    if run_singer: del ts_est_singer
-                    del ts_est_liana
-                    
-                    # Force garbage collection
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                  
+                        csvfile.flush()
+                        os.fsync(csvfile.fileno())  # Optional: forces OS/hardware flush      
+                  
+                        # Cleanup variables to prevent memory leaks in the loop
+                        del data, x, pos, ts_true
+                        if run_relate: del ts_est_relate
+                        if run_singer: del ts_est_singer
+                        del ts_est_liana
                         
-                    #log_mem(f"End of loop after cleanup (Key: {key_str})")
+                        # Force garbage collection
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception as e:
+                        print(e)
+                        pass
+                        
             env.close()
             
-    # summarize_results(args.output, run_relate, run_singer)
+    summarize_results(args.output, run_relate, run_singer)
     print(f"\nBenchmarking complete. Results saved to {args.output}")
 
 if __name__ == '__main__':
