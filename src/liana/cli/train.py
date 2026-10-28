@@ -5,6 +5,7 @@ import logging
 import itertools
 import numpy as np
 import time
+import sys
 import random
 
 os.environ["PYTHONWARNINGS"] = "ignore::FutureWarning:msprime"
@@ -328,8 +329,10 @@ class DiskWaveletDataset(IterableDataset):
 
             Y = np.array(Y)
 
+            
             print(x.shape, Y.shape, y.shape)            
-
+            sys.stdout.flush()
+            
             # Apply original transformations
             x = flip(x)
             
