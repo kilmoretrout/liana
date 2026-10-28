@@ -312,6 +312,9 @@ class DiskWaveletDataset(IterableDataset):
                 # Overwrite x with the filtered array
                 x = x[:, cols_to_keep]
                 pos = pos[cols_to_keep]
+                
+            if x.shape[1] < self.args.size:
+                continue
             
             pos_diff = np.diff(pos, append = np.zeros(1))
             
