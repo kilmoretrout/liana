@@ -12,7 +12,7 @@ def benchmark_lmdb(lmdb_path, n_reads):
     
     # Grab the first N keys
     with env.begin() as txn:
-        keys = [key for key, _ in txn.cursor().iternext(keys=True, values=False)]
+        keys = [key for key in txn.cursor().iternext(keys=True, values=False)]
     keys = keys[:n_reads]
     
     start_time = time.time()
