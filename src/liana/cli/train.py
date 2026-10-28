@@ -235,6 +235,8 @@ class DiskWaveletDataset(IterableDataset):
             ints = data.get('intervals')
             pos = data.get('pos')
             
+            print(pos.shape, np.unique(pos).shape)
+            
             params = data.get('params', {})
             
             if self.n:
@@ -320,40 +322,51 @@ class DiskWaveletDataset(IterableDataset):
             
             pos_diff = np.diff(pos, append = np.zeros(1))
             
-            Y = np.full((pos.shape[0], y.shape[1]), np.inf, dtype=np.float32)
+            pos_L = pos * self.L
+            starts = ints[:, 0]
+            ends = ints[:, 1]
             
-            for k in range(y.shape[0]):
-                a, b = ints[k]
-                ii_ = np.where((pos * self.L >= a) & (pos * self.L < b))[0]
-                if len(ii_) > 0:
-                    Y[ii_] = y[k]
-
-            Y = np.array(Y)
+            # Binary search to find the correct interval index for each position
+            idx = np.searchsorted(starts, pos_L, side='right') - 1
+            idx = np.clip(idx, 0, len(starts) - 1) # Prevent out-of-bounds on edge cases
+            
+            # Validate that the position actually falls within [start, end)
+            valid = (pos_L >= starts[idx]) & (pos_L < ends[idx])
+            
+            Y = np.full((pos.shape[0], y.shape[1]), np.inf, dtype=np.float32)
+            Y[valid] = y[idx[valid]]
 
             # Apply original transformations
             x = flip(x)
-            
             with np.errstate(divide='ignore'):
                 Y = np.log(Y)
             
             if len(self.scales) > 0:
                 xw = pgml.compute_cwt(x, self.scales, config)
-                x_concat = np.concatenate([np.expand_dims(x, 0), xw])
-            else:
-                x_concat = np.expand_dims(x, 0)
                 
-            x_concat = np.concatenate([x_concat, np.tile(pos_diff.reshape(1, 1, -1), (1, x_concat.shape[1], 1))], 0)
-        
-            max_idx = max(1, x_concat.shape[2] - self.args.size)
-        
+            max_idx = max(1, x.shape[1] - self.args.size)
+            
             for ij in range(self.args.n_samples):
                 ii = np.random.randint(0, max_idx)
                 
-                X_chunk_np = x_concat[:, :, ii:ii + self.args.size]
-                D_chunk_np = Y[ii:ii + self.args.size] 
+                # ==========================================
+                # OPTIMIZATION 2: Slice BEFORE Concat & Tile
+                # ==========================================
+                # 1. Extract the tiny 512-SNP window first
+                x_slice = x[:, ii:ii + self.args.size]
+                D_chunk_np = Y[ii:ii + self.args.size]
+                pos_diff_slice = pos_diff[ii:ii + self.args.size]
                 
-                if len(np.where(D_chunk_np == np.inf)[0]) > 0:
-                    continue
+                # 2. Build the final array using only the tiny slices
+                if len(self.scales) > 0:
+                    xw_slice = xw[:, :, ii:ii + self.args.size]
+                    X_chunk_np = np.concatenate([np.expand_dims(x_slice, 0), xw_slice], axis=0)
+                else:
+                    X_chunk_np = np.expand_dims(x_slice, 0)
+                    
+                # 3. Tile the positional differences only for the sliced width
+                pos_tile = np.tile(pos_diff_slice.reshape(1, 1, -1), (1, X_chunk_np.shape[1], 1))
+                X_chunk_np = np.concatenate([X_chunk_np, pos_tile], axis=0)
                 
                 X_tensor = torch.from_numpy(X_chunk_np).float()
                 D_tensor = torch.from_numpy(D_chunk_np).float()
