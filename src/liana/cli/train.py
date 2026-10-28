@@ -234,9 +234,7 @@ class DiskWaveletDataset(IterableDataset):
             y = data.get('D')
             ints = data.get('intervals')
             pos = data.get('pos')
-            
-            print(pos.shape, np.unique(pos).shape)
-            
+                        
             params = data.get('params', {})
             
             if self.n:
