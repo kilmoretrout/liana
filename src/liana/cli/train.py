@@ -234,6 +234,8 @@ class DiskWaveletDataset(IterableDataset):
             y = data.get('D')
             ints = data.get('intervals')
             pos = data.get('pos')
+            print(np.max(pos), np.min(pos))
+            
             params = data.get('params', {})
             
             if self.n:
@@ -319,19 +321,22 @@ class DiskWaveletDataset(IterableDataset):
             
             pos_diff = np.diff(pos, append = np.zeros(1))
             
-            Y = []
+            Y = np.full((pos.shape[0], y.shape[1]), np.inf, dtype=np.float32)
+            
             for k in range(y.shape[0]):
                 a, b = ints[k]
-                
                 ii_ = np.where((pos * self.L >= a) & (pos * self.L < b))[0]
-        
-                Y.extend([y[k] for u in range(len(ii_))])
+                if len(ii_) > 0:
+                    Y[ii_] = y[k]
 
             Y = np.array(Y)
 
             
-            print(x.shape, Y.shape, y.shape)            
+            print(x.shape, Y.shape, y.shape)         
+            print(np.where(Y == np.inf))
+            
             sys.stdout.flush()
+            sys.exit() 
             
             # Apply original transformations
             x = flip(x)
