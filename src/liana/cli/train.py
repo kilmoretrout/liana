@@ -234,7 +234,6 @@ class DiskWaveletDataset(IterableDataset):
             y = data.get('D')
             ints = data.get('intervals')
             pos = data.get('pos')
-            print(np.max(pos), np.min(pos))
             
             params = data.get('params', {})
             
@@ -331,13 +330,6 @@ class DiskWaveletDataset(IterableDataset):
 
             Y = np.array(Y)
 
-            
-            print(x.shape, Y.shape, y.shape)         
-            print(np.where(Y == np.inf))
-            
-            sys.stdout.flush()
-            sys.exit() 
-            
             # Apply original transformations
             x = flip(x)
             
@@ -359,6 +351,9 @@ class DiskWaveletDataset(IterableDataset):
                 
                 X_chunk_np = x_concat[:, :, ii:ii + self.args.size]
                 D_chunk_np = Y[ii:ii + self.args.size] 
+                
+                if len(np.where(D_chunk_np == np.inf)[0]) > 0:
+                    continue
                 
                 X_tensor = torch.from_numpy(X_chunk_np).float()
                 D_tensor = torch.from_numpy(D_chunk_np).float()
