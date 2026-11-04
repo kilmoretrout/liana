@@ -59,8 +59,6 @@ def main():
         sim = MSPrimeSimulator(args.ifile)
     else:
         sim = DiscoalSimulator(args.ifile)
-    # number of haploids
-    n = 2 * sim.samples['pop1']['n']
 
     db_path = os.path.join(args.odir, f'simulations_{args.job_id}.lmdb')
     env = lmdb.open(db_path, map_size=1099511627776)
@@ -75,7 +73,7 @@ def main():
             tree = ts.first()
         else:
             ij = 0
-            tree = ts[ij].first()
+            tree = ts[ij]
             
         print('have genotype matrix shape: {}'.format(ret['x'].shape))
         sys.stdout.flush()
@@ -103,7 +101,7 @@ def main():
                 ij += 1
                 
                 if ij < len(ts):
-                    tree = ts[ij].first()
+                    tree = ts[ij]
                 else:
                     break
         
