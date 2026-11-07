@@ -134,7 +134,7 @@ def main():
     print(f"Using {device} for liana model inference")
 
     if '.lmdb' in args.input:
-        lmdb_paths = [args.input]
+        lmdb_paths = [Path(args.input)]
     else:
         lmdb_paths = sorted(find_lmdb_envs(args.input))
         if not lmdb_paths:
