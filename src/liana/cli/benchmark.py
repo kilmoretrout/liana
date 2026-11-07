@@ -64,6 +64,8 @@ def parse_args():
     # Custom Model Arguments 
     parser.add_argument("-w", "--weights", default="models/n16_k11_cheby/best_model.pth", help="Path to PyTorch weights")
     parser.add_argument("--two_pop", action = "store_true", help = "For two-pop data.  Assumes the same number of haploids in each population when downsampling to 2*n haploids")
+    parser.add_argument("--skip_liana", action="store_true", help="Skip running the Liana model entirely.")
+    parser.add_argument("--L", default=2.5e6, type=float, help="length in bp of simulated chroms")
     
     args = parser.parse_args()
     
@@ -130,15 +132,15 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using {device} for liana model inference")
-    
-    #log_mem("After initial setup")
 
-    # 2. Discover LMDBs
-    lmdb_paths = sorted(find_lmdb_envs(args.input))
-    if not lmdb_paths:
-        print(f"No valid LMDB environments found at: {args.input}")
-        return
-    print(f"Found {len(lmdb_paths)} LMDB environment(s). Starting benchmark...")
+    if '.lmdb' in args.input:
+        lmdb_paths = [args.input]
+    else:
+        lmdb_paths = sorted(find_lmdb_envs(args.input))
+        if not lmdb_paths:
+            print(f"No valid LMDB environments found at: {args.input}")
+            return
+        print(f"Found {len(lmdb_paths)} LMDB environment(s). Starting benchmark...")
 
     # 3. Setup Outputs
     csv_columns = [
@@ -216,12 +218,13 @@ def main():
                         
                     x = flip(x)
                                         
-                    ts_true = PGTreeSequence.from_tskit(ts_raw, ii)
                     n_samples = x.shape[0]
                     
                     mu = params.get('mu', args.mu)
                     r = params.get('r', args.r)
                     sim_L = params.get('L', args.L) 
+                    
+                    ts_true = PGTreeSequence.from_tskit(ts_raw, ii, positions = pos * sim_L)
                     
                     N_est = watterson_estimate_N(S=len(pos), n=n_samples, mu=mu, L=sim_L)
 
@@ -236,26 +239,30 @@ def main():
                         
                         if run_singer:
                             start_time = time.time()
-                            ts_est_singer = next(singer(x.astype(np.uint8), pos, mu, r, sim_L, thin = args.thin))
+                            ts_est_singer = next(singer(x.astype(np.uint8), pos, mu, r, sim_L))
                             singer_time = time.time() - start_time
-                        
-                        start_time = time.time()
-                        ts_est_liana = liana(args.weights, x, pos, args.L, args.window_size, device_str='cuda')
-                        pytorch_time = time.time() - start_time
                         
                         row = {
                             'db_name': db_path.name,
                             'key': key_str,
                             'N_est': round(N_est, 2),
-                            
-                            'liana_time': round(pytorch_time, 4),
-                            'liana_kc': ts_est_liana.kc_distance(ts_true),
-                            'liana_rf': ts_est_liana.rf_distance(ts_true),
-                            'liana_rms_log_coal': ts_est_liana.rms_log_coal_error(ts_true),
-                            'liana_kl': ts_est_liana.symmetric_kl_divergence(ts_true),
-                            'liana_chamfer': ts_est_liana.breakpoint_chamfer_distance(ts_true),
-                            'liana_ntrees': np.abs(ts_est_liana.num_trees - ts_true.num_trees),
                         }
+                        
+                        # Conditionally run Liana
+                        if not args.skip_liana:
+                            start_time = time.time()
+                            ts_est_liana = liana(args.weights, x, pos, args.L, args.window_size, device_str='cuda')
+                            pytorch_time = time.time() - start_time
+                            
+                            row.update({
+                                'liana_time': round(pytorch_time, 4),
+                                'liana_kc': ts_est_liana.kc_distance(ts_true),
+                                'liana_rf': ts_est_liana.rf_distance(ts_true),
+                                'liana_rms_log_coal': ts_est_liana.rms_log_coal_error(ts_true),
+                                'liana_kl': ts_est_liana.symmetric_kl_divergence(ts_true),
+                                'liana_chamfer': ts_est_liana.breakpoint_chamfer_distance(ts_true),
+                                'liana_ntrees': np.abs(ts_est_liana.num_trees - ts_true.num_trees),
+                            })
                         
                         if run_relate:
                             row.update({
@@ -282,15 +289,13 @@ def main():
                         writer.writerow(row)
                   
                         csvfile.flush()
-                        os.fsync(csvfile.fileno())  # Optional: forces OS/hardware flush      
+                        os.fsync(csvfile.fileno())     
                   
-                        # Cleanup variables to prevent memory leaks in the loop
                         del data, x, pos, ts_true
                         if run_relate: del ts_est_relate
                         if run_singer: del ts_est_singer
-                        del ts_est_liana
-                        
-                        # Force garbage collection
+                        if not args.skip_liana: del ts_est_liana                       
+
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
