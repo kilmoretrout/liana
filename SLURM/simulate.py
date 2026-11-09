@@ -36,7 +36,8 @@ def parse_args():
                         help="Write VCF files (passed to simulate.py)")
     parser.add_argument("--verbose", action="store_true", 
                         help="Display verbose messages in the runner")
-
+    parser.add_argument("--eval", action="store_true", 
+                    help="save ts")
     args = parser.parse_args()
     
     if args.verbose:
@@ -78,6 +79,9 @@ def main():
             python_cmd_parts.append("--discoal")
         if args.write_vcf:
             python_cmd_parts.append("--write_vcf")
+         
+        if args.eval:
+            python_cmd_parts.append("--eval")
             
         python_cmd = " ".join(python_cmd_parts)
         
