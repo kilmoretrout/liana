@@ -81,11 +81,10 @@ def main():
         Ds = []
         coal_times = []
         
-        if type(ts) != list:
-            intervals = []
-        else:
-            intervals = ret['intervals']
+        intervals = ret['intervals']
             
+        print(intervals[0], intervals[-1])
+        
         while True:
             D = tree_to_distmat(tree)
                   
