@@ -25,92 +25,147 @@ from popgenml.data import PGTreeSequence
 def build_tree_worker(d_mat, method):
     return distmat_to_tree(d_mat, method=method)[0]
 
-def make_coherent(coals, trees):
-    ret = dict()
-    ret['tree'] = []
-    ret['snps'] = []
-    ret['coal'] = []
-    
-    ii = 0
-    indices = [ii]
-    T = trees[ii]
-    _ = []
-    ints = []
-    
-    start = 0
-    
-    while ii < len(coals) - 1:
-        dist = trees[ii].kc_distance(trees[ii + 1])
-        
-        if dist > 0:
-            ints.append((start, start + len(indices)))
-            start += len(indices)
-            
-            ret['coal'].append(stats.hmean(np.array([coals[u] for u in indices]), axis = 0))
-            ret['snps'].append(len(indices))
-            ret['tree'].append(T)
-        
-            _.extend([ret['coal'][-1] for u in range(ret['snps'][-1])])
-        
-            indices = [ii + 1]
-            dist = 0
+def extract_canonical_clades(tree):
+    """
+    Extracts canonical topology strings matching liana/lib/src/main.rs:
+    - Leaves are represented as `str(u)`.
+    - Internal nodes are represented as `({child0},{child1})` with children sorted lexicographically.
+
+    Returns:
+        tuple: (topology_hash, clades_dict) where clades_dict maps canonical clade string -> node time.
+    """
+    topologies = {}
+    clades = {}
+    for u in tree.nodes(order="postorder"):
+        if tree.is_sample(u):
+            topologies[u] = str(u)
         else:
-            indices.append(ii + 1)
+            children = sorted(topologies[c] for c in tree.children(u))
+            topo = f"({','.join(children)})"
+            topologies[u] = topo
+            clades[topo] = float(tree.time(u))
+    return topologies[tree.root], clades
 
-        ii += 1
-        T = trees[ii]
-        
-    ret['tree'].append(T)
-    ret['coal'].append(np.mean(np.array([coals[u] for u in indices]), axis = 0))
-    ret['snps'].append(len(indices))
-    ints.append((start, start + len(indices)))
+def apply_smoothed_times(tree, smoothed_times, eps=1e-7):
+    """
+    Rebuilds a tskit.Tree with internal node times replaced by `smoothed_times`
+    in ascending internal node ID (UPGMA merge) order, matching main.rs:build_newick.
+    Applies a minimal monotonic nudge only if needed to satisfy tskit's strict parent > child invariant.
+    """
+    tables = tree.tree_sequence.dump_tables()
+    internal_nodes = sorted([u for u in tree.nodes() if not tree.is_sample(u)])
 
-    _.extend([ret['coal'][-1] for u in range(ret['snps'][-1])])
-    
-    return np.array(_), ret['snps'], ret['tree'], ints, np.array(ret['coal'])
+    times = np.asarray(smoothed_times, dtype=np.float64).copy()
+    for i in range(len(times)):
+        if i == 0:
+            if times[i] < eps:
+                times[i] = eps
+        else:
+            min_allowed = max(times[i - 1] + eps, np.nextafter(times[i - 1], np.inf))
+            if times[i] < min_allowed:
+                times[i] = min_allowed
+
+    for idx, node_id in enumerate(internal_nodes):
+        tables.nodes[node_id] = tables.nodes[node_id].replace(time=float(times[idx]))
+
+    tables.sort()
+    return tables.tree_sequence().first(sample_lists=True)
+
+def make_coherent(coals, trees, topo_hashes=None):
+    """
+    Collapses contiguous runs of identical tree topologies (by canonical topology hash,
+    matching main.rs) and rebuilds each region's tree with the smoothed coalescent times
+    at `start_idx`.
+    """
+    if topo_hashes is None:
+        topo_hashes = [extract_canonical_clades(t)[0] for t in trees]
+
+    ret_trees = []
+    ret_snps = []
+    ret_coals = []
+    ints = []
+    expanded_coals = []
+
+    current_topology = topo_hashes[0]
+    start_idx = 0
+
+    for i in range(1, len(trees)):
+        if topo_hashes[i] != current_topology:
+            region_len = i - start_idx
+            region_coal = coals[start_idx]
+            ints.append((start_idx, i))
+            ret_snps.append(region_len)
+            ret_coals.append(region_coal)
+            ret_trees.append(apply_smoothed_times(trees[start_idx], region_coal))
+            expanded_coals.extend([region_coal] * region_len)
+
+            current_topology = topo_hashes[i]
+            start_idx = i
+
+    region_len = len(trees) - start_idx
+    region_coal = coals[start_idx]
+    ints.append((start_idx, len(trees)))
+    ret_snps.append(region_len)
+    ret_coals.append(region_coal)
+    ret_trees.append(apply_smoothed_times(trees[start_idx], region_coal))
+    expanded_coals.extend([region_coal] * region_len)
+
+    return np.array(expanded_coals), ret_snps, ret_trees, ints, np.array(ret_coals)
 
 def average_clade_times(tree_list):
     """
-    Tracks clades across contiguous tskit trees, calculates the HARMONIC average 
-    of their coalescent times, and returns a list of lists of averaged times.
+    Tracks canonical-topology clades across contiguous trees (matching main.rs:average_clade_times),
+    calculates the harmonic average of their coalescent times, and returns sorted smoothed times per tree.
+
+    Accepts either a sequence of tskit.Tree objects or pre-extracted clade dicts {clade_str: time}.
     """
-    runs = [] 
-    active_runs = {} 
-    
-    for tree_idx, tree in enumerate(tree_list):
-        current_clades = {}
-        
-        for u in tree.nodes():
-            if not tree.is_sample(u):
-                clade = frozenset(tree.samples(u))
-                current_clades[clade] = tree.time(u)
-                
+    runs = []
+    active_runs = {}
+
+    for tree_idx, item in enumerate(tree_list):
+        if isinstance(item, dict):
+            current_clades = item
+        else:
+            _, current_clades = extract_canonical_clades(item)
+
         current_clade_set = set(current_clades.keys())
         active_clade_set = set(active_runs.keys())
-        
+
         for clade in active_clade_set - current_clade_set:
             del active_runs[clade]
-            
+
         for clade, time in current_clades.items():
             if clade not in active_runs:
                 run_idx = len(runs)
-                runs.append({'clade': clade, 'times': [], 'trees': []})
+                runs.append(([], []))
                 active_runs[clade] = run_idx
-            
+
             run_idx = active_runs[clade]
-            runs[run_idx]['times'].append(time)
-            runs[run_idx]['trees'].append(tree_idx)
-            
+            runs[run_idx][0].append(time)
+            runs[run_idx][1].append(tree_idx)
+
     result = [[] for _ in range(len(tree_list))]
-    
-    for run in runs:
-        avg_time = statistics.harmonic_mean(run['times'])
-        for tree_idx in run['trees']:
+
+    for times, tree_indices in runs:
+        has_zero = False
+        sum_inv = 0.0
+        for t in times:
+            if t <= 0.0:
+                has_zero = True
+                break
+            sum_inv += 1.0 / t
+
+        if has_zero or sum_inv == 0.0:
+            avg_time = 0.0
+        else:
+            avg_time = len(times) / sum_inv
+
+        for tree_idx in tree_indices:
             result[tree_idx].append(avg_time)
-            
-    for i in range(len(result)):
-        result[i].sort()
-        
+
+    for res in result:
+        res.sort()
+
     return result
 
 
@@ -190,11 +245,11 @@ def liana(
         model.load_state_dict(torch.load(weights, map_location=device), strict=False)
     
     model.eval()
-    reg = UNetRegressor(model, scales, mu_x, std_x, mu_y, std_y)
+    reg = UNetRegressor(model, scales, mu_x, std_x, mu_y, std_y, device=device)
 
     # 2. Prepare Data Arrays
     x_ndarray = np.array(x, dtype=np.float32)
-    pos_ndarray = np.array(pos, dtype=np.float32)
+    pos_ndarray = np.array(pos, dtype=np.float64)
     num_ind, num_snps = x_ndarray.shape
     
     # Scale fractional [0,1] positions up to physical base pairs for the window logic
@@ -277,16 +332,16 @@ def liana(
         logging.warning("No trees were generated.")
         return PGTreeSequence(trees=[], snps=[])
 
-    coal_times_pred = []
-    for t in trees_pred:
-        c = [t.time(u) for u in t.nodes()]
-        c = sorted([u for u in c if u > 0])
-        coal_times_pred.append(c)
+    extracted = [extract_canonical_clades(t) for t in trees_pred]
+    topo_hashes = [h for h, _ in extracted]
+    clades_list = [c for _, c in extracted]
 
-    coal_times_pred_fwd = np.array(average_clade_times(trees_pred))
-    coal_times_pred_rev = np.array(average_clade_times(trees_pred[::-1])[::-1])
-    coal_times_pred_avg = (coal_times_pred_fwd + coal_times_pred_rev) / 2.
+    coal_times_pred_fwd = np.array(average_clade_times(clades_list), dtype=np.float64)
+    coal_times_pred_rev = np.array(average_clade_times(clades_list[::-1])[::-1], dtype=np.float64)
+    coal_times_pred_avg = (coal_times_pred_fwd + coal_times_pred_rev) / 2.0
 
-    coal_times_pred_final, snps_coherent, trees_coherent, intervals, coal = make_coherent(coal_times_pred_avg, trees_pred)
+    coal_times_pred_final, snps_coherent, trees_coherent, intervals, coal = make_coherent(
+        coal_times_pred_avg, trees_pred, topo_hashes=topo_hashes
+    )
     
     return PGTreeSequence(trees=trees_coherent, snps=snps_coherent)

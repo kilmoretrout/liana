@@ -189,7 +189,6 @@ def main():
                     x = data['x'].astype(np.float32)
                     pos = data['pos']
                     params = data.get('params', {})
-                    print(params)
                     
                     ts_raw = data['ts']
                     n_diploids_total = x.shape[0] // 2

@@ -11,6 +11,7 @@ from tqdm import tqdm
 from liana.models.layers import ConvGCNUNet
 from liana.models.regressors import UNetRegressor
 import pgml
+from popgenml.data.functions import flip
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -84,7 +85,7 @@ def load_and_filter_vcf(vcf_path, target_ind=32, total_L=None):
                 pos_list.append(pos)
                 geno_list.append(np.array(row, dtype=np.float32))
                 
-    pos_ndarray = np.array(pos_list, dtype=np.float32)
+    pos_ndarray = np.array(pos_list, dtype=np.float64)
     
     # If positions are fractional [0, 1] (e.g. from msprime), scale them to physical bp!
     if total_L is not None and pos_ndarray[-1] <= 1.05:
@@ -136,13 +137,15 @@ def main():
     model.eval()
     
     # Pass to your regressor
-    reg = UNetRegressor(model, scales, mu_x, std_x, mu_y, std_y)
+    reg = UNetRegressor(model, scales, mu_x, std_x, mu_y, std_y, device=device)
 
     # ---------------------------------------------------------
     # 2. Parse VCF
     # ---------------------------------------------------------
     x_ndarray, pos_ndarray = load_and_filter_vcf(args.vcf, target_ind=args.target_ind, total_L=args.L)
     num_ind, num_snps = x_ndarray.shape
+    
+    x_ndarray = flip(x_ndarray)
     
     # ---------------------------------------------------------
     # 3. Stream Inference over 1Mb Windows
@@ -215,8 +218,8 @@ def main():
             offset = chunk_start_idx - temp_start
             D_pred = D_pred_padded[offset : offset + current_chunk_len, :]
             
-            # Stream exactly identically to Rust: float32 raw bytes
-            D_pred.astype(np.float32).tofile(out_file)
+            # Stream exactly identically to Rust: float64 raw bytes
+            D_pred.astype(np.float64).tofile(out_file)
             
             pbar.update(int(window_size_bp))
             current_bp = target_bp
