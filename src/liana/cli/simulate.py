@@ -71,9 +71,13 @@ def main():
         if type(ts) != list:
             ts = ts.simplify(reduce_to_site_topology = True)
             tree = ts.first()
+            
+            intervals = []
         else:
             ij = 0
             tree = ts[ij]
+            
+            intervals = ret['intervals']
             
         print('have genotype matrix shape: {}'.format(ret['x'].shape))
         sys.stdout.flush()
@@ -81,8 +85,6 @@ def main():
         Ds = []
         coal_times = []
         
-        intervals = ret['intervals']
-                    
         while True:
             D = tree_to_distmat(tree)
                   
