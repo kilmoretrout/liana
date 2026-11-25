@@ -82,9 +82,7 @@ def main():
         coal_times = []
         
         intervals = ret['intervals']
-            
-        print(intervals[0], intervals[-1])
-        
+                    
         while True:
             D = tree_to_distmat(tree)
                   
@@ -117,15 +115,7 @@ def main():
             'params': sim.params,
         }
         if args.eval:
-            # PATCH: Check if 'ts' is a list of tskit.Tree objects
-            if isinstance(ts, list) and len(ts) > 0 and hasattr(ts[0], 'tree_sequence'):
-                data_dict['ts'] = {
-                    '_is_tree_list': True,
-                    'parent_ts': ts[0].tree_sequence,
-                    'indices': [t.index for t in ts]
-                }
-            else:
-                data_dict['ts'] = ts
+            data_dict['ts'] = [t.tree_sequence for t in ts] if isinstance(ts, list) else ts
         
         byte_data = pickle.dumps(data_dict, protocol=-1)
         

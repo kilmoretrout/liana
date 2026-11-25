@@ -192,6 +192,7 @@ def main():
                     
                     ts_raw = data['ts']
                     n_diploids_total = x.shape[0] // 2
+                    ii = None
                     
                     if hasattr(args, 'n') and args.n is not None and args.n < n_diploids_total:
                         paired_indices = np.array([[2*u, 2*u + 1] for u in range(n_diploids_total)], dtype=np.int32)
@@ -225,7 +226,12 @@ def main():
                     r = params.get('r', args.r)
                     sim_L = params.get('L', args.L) 
                     
-                    ts_true = PGTreeSequence.from_tskit(ts_raw, ii, positions = pos * sim_L)
+                    if isinstance(ts_raw, list):
+                        ts_true = PGTreeSequence.from_tree_list(
+                            ts_raw, data['intervals'], samples_to_keep=ii, positions=pos * sim_L
+                        )
+                    else:
+                        ts_true = PGTreeSequence.from_tskit(ts_raw, ii, positions=pos * sim_L)
                     
                     N_est = watterson_estimate_N(S=len(pos), n=n_samples, mu=mu, L=sim_L)
 

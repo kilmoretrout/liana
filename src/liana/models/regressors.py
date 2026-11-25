@@ -34,8 +34,14 @@ class UNetRegressor(object):
         start = 0
         end = self.size
         
-        D_pred = np.zeros((x.shape[1], x.shape[0] * (x.shape[0] - 1) // 2))
-        count = np.zeros(D_pred.shape)
+        log_D_pred = np.zeros((x.shape[1], x.shape[0] * (x.shape[0] - 1) // 2), dtype=np.float64)
+        weight_sum = np.zeros((x.shape[1], 1), dtype=np.float64)
+
+        # Raised-cosine (Hann) window weights with a small floor so sequence edges never divide by 0
+        win_weights = (
+            0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(self.size, dtype=np.float64) / (self.size - 1)))
+            + 1e-3
+        ).reshape(-1, 1)
         
         windows = []
         while end < x.shape[-1]:
@@ -71,13 +77,13 @@ class UNetRegressor(object):
                 D_pred_batch, _ = self.model(batch_tensor)
                 D_pred_batch = D_pred_batch.detach().cpu().numpy()
             
-            # Accumulate predictions back to their original positions
+            # Accumulate weighted predictions in log-space (geometric mean across overlapping windows)
             for j, (a, b) in enumerate(batch_windows):
-                D_pred[a:b] += np.exp(D_pred_batch[j] * self.std_y + self.mu_y)
-                count[a:b] += 1.
+                log_D_pred[a:b] += (D_pred_batch[j] * self.std_y + self.mu_y) * win_weights
+                weight_sum[a:b] += win_weights
             
         # final distance prediction
-        D_pred = D_pred / count
+        D_pred = np.exp(log_D_pred / weight_sum)
 
         return D_pred    
         
