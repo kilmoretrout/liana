@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument("--thin", default = 20, type = int)
     
     # Benchmarking Targets
-    parser.add_argument("-b", "--bench_against", choices=['all', 'singer', 'relate'], default='all',
+    parser.add_argument("-b", "--bench_against", choices=['all', 'singer', 'relate', 'none'], default='all',
                         help="Which baseline tools to benchmark against Liana. Default is 'all'.")
     
     # Samples Argument

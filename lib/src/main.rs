@@ -32,11 +32,11 @@ pub struct Tree {
     pub topology_hash: String,
     pub clades: Vec<String>, // Tracks the canonical string for each internal node
     pub merges: Vec<(usize, usize)>,
-    pub node_times: Vec<f32>,
+    pub node_times: Vec<f64>,
 }
 
-pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
-    let mut dist = vec![vec![0.0; n * 2]; n * 2];
+pub fn run_upgma(condensed_dist: &[f64], n: usize) -> Tree {
+    let mut dist = vec![vec![0.0_f64; n * 2]; n * 2];
     for i in 0..n {
         for j in (i + 1)..n {
             let d = condensed_dist[get_idx(n, i, j)];
@@ -46,7 +46,7 @@ pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
     }
 
     let mut active = vec![true; n * 2];
-    let mut cluster_size = vec![1.0; n * 2];
+    let mut cluster_size = vec![1.0_f64; n * 2];
     let mut topologies = vec![String::new(); n * 2];
     
     let mut clades = Vec::with_capacity(n - 1);
@@ -60,7 +60,7 @@ pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
     let mut next_node = n;
 
     for _ in 0..(n - 1) {
-        let mut min_d = f32::MAX;
+        let mut min_d = f64::MAX;
         let mut min_i = 0;
         let mut min_j = 0;
 
@@ -118,20 +118,53 @@ pub fn run_upgma(condensed_dist: &[f32], n: usize) -> Tree {
 }
 
 // ---------------------------------------------------------
-// Clade Smoothing & Harmonic Averaging
+// Post-UPGMA Topological Blip Removal
 // ---------------------------------------------------------
-fn average_clade_times(trees: &[Tree]) -> Vec<Vec<f32>> {
-    let mut runs: Vec<(Vec<f32>, Vec<usize>)> = Vec::new();
+fn remove_topology_blips(trees: &mut Vec<Tree>, max_blip_len: usize) {
+    let n_snps = trees.len();
+    if n_snps <= 2 || max_blip_len == 0 {
+        return;
+    }
+
+    let mut runs: Vec<(usize, usize, String)> = Vec::new();
+    let mut start = 0;
+    for i in 1..n_snps {
+        if trees[i].topology_hash != trees[start].topology_hash {
+            runs.push((start, i, trees[start].topology_hash.clone()));
+            start = i;
+        }
+    }
+    runs.push((start, n_snps, trees[start].topology_hash.clone()));
+
+    if runs.len() < 3 {
+        return;
+    }
+
+    for k in 1..(runs.len() - 1) {
+        let (r_start, r_end, _) = runs[k];
+        if (r_end - r_start) <= max_blip_len && runs[k - 1].2 == runs[k + 1].2 {
+            let ref_tree = trees[r_start - 1].clone();
+            for idx in r_start..r_end {
+                trees[idx] = ref_tree.clone();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------
+// Clade Smoothing & Geometric Averaging (Per-Node Assignment)
+// ---------------------------------------------------------
+fn average_clade_times(trees: &[Tree]) -> Vec<Vec<f64>> {
+    if trees.is_empty() {
+        return Vec::new();
+    }
+
+    let mut runs: Vec<(Vec<f64>, Vec<(usize, usize)>)> = Vec::new();
     let mut active_runs: HashMap<&str, usize> = HashMap::new(); // Zero-allocation tracking!
     
     // Pass 1: Extract clades and group into contiguous runs
     for (tree_idx, tree) in trees.iter().enumerate() {
-        let mut current_clades = HashMap::new();
-        for (i, clade) in tree.clades.iter().enumerate() {
-            current_clades.insert(clade.as_str(), tree.node_times[i]);
-        }
-        
-        let current_clade_set: HashSet<&str> = current_clades.keys().copied().collect();
+        let current_clade_set: HashSet<&str> = tree.clades.iter().map(|c| c.as_str()).collect();
         let active_clade_set: HashSet<&str> = active_runs.keys().copied().collect();
         
         // End tracking for clades no longer in current tree
@@ -139,55 +172,52 @@ fn average_clade_times(trees: &[Tree]) -> Vec<Vec<f32>> {
             active_runs.remove(clade);
         }
         
-        // Update continuing and start new runs
-        for (clade, time) in current_clades {
-            let run_idx = *active_runs.entry(clade).or_insert_with(|| {
+        // Update continuing and start new runs, tracking exact (tree_idx, clade_idx)
+        for (clade_idx, clade) in tree.clades.iter().enumerate() {
+            let time = tree.node_times[clade_idx];
+            let run_idx = *active_runs.entry(clade.as_str()).or_insert_with(|| {
                 let idx = runs.len();
                 runs.push((Vec::new(), Vec::new()));
                 idx
             });
             runs[run_idx].0.push(time);
-            runs[run_idx].1.push(tree_idx);
+            runs[run_idx].1.push((tree_idx, clade_idx));
         }
     }
     
-    // Pass 2: Calculate harmonic averages
-    let mut result = vec![Vec::with_capacity(trees[0].clades.len()); trees.len()];
+    // Pass 2: Calculate geometric averages and write back to each clade's own node slot
+    let num_internal = trees[0].clades.len();
+    let mut result = vec![vec![0.0_f64; num_internal]; trees.len()];
     
-    for (times, tree_indices) in runs {
-        let mut has_zero = false;
-        let mut sum_inv = 0.0;
+    for (times, locations) in runs {
+        let mut has_nonpos = false;
+        let mut sum_log = 0.0_f64;
         
         for &t in &times {
             if t <= 0.0 {
-                has_zero = true;
+                has_nonpos = true;
                 break;
             }
-            sum_inv += 1.0 / t;
+            sum_log += t.ln();
         }
         
-        let avg_time = if has_zero || sum_inv == 0.0 {
+        let avg_time = if has_nonpos {
             0.0
         } else {
-            (times.len() as f32) / sum_inv
+            (sum_log / (times.len() as f64)).exp()
         };
         
-        for &idx in &tree_indices {
-            result[idx].push(avg_time);
+        for &(tree_idx, clade_idx) in &locations {
+            result[tree_idx][clade_idx] = avg_time;
         }
-    }
-    
-    // Sort times for each tree to ensure monotonic increasing heights for UPGMA
-    for res in &mut result {
-        res.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     }
     
     result
 }
 
-// Reconstructs a standard Newick string using the SMOOTHED coalescent times
-fn build_newick(n: usize, merges: &[(usize, usize)], node_times: &[f32]) -> String {
-    let mut heights = vec![0.0; n * 2];
+// Reconstructs a standard Newick string using the per-node SMOOTHED coalescent times
+fn build_newick(n: usize, merges: &[(usize, usize)], node_times: &[f64]) -> String {
+    let mut heights = vec![0.0_f64; n * 2];
     let mut strings = vec![String::new(); n * 2];
     
     for i in 0..n {
@@ -196,12 +226,14 @@ fn build_newick(n: usize, merges: &[(usize, usize)], node_times: &[f32]) -> Stri
     
     for i in 0..(n - 1) {
         let parent = n + i;
-        heights[parent] = node_times[i];
-        
         let (c1, c2) = merges[i];
+
+        // Resolve only parent-child inversions bottom-up without swapping unrelated clades
+        let h = node_times[i].max(heights[c1]).max(heights[c2]);
+        heights[parent] = h;
         
-        let bl1 = (heights[parent] - heights[c1]).max(0.0);
-        let bl2 = (heights[parent] - heights[c2]).max(0.0);
+        let bl1 = h - heights[c1];
+        let bl2 = h - heights[c2];
         
         strings[parent] = format!("({}:{},{}:{})", strings[c1], bl1, strings[c2], bl2);
     }
@@ -227,7 +259,7 @@ fn main() -> anyhow::Result<()> {
         let cols: Vec<&str> = line.trim_end().split('\t').collect();
         if cols.len() < 9 + n { line.clear(); continue; }
         
-        let pos: f32 = cols[1].parse()?;
+        let pos: f64 = cols[1].parse()?;
         
         let mut first_val = -1.0;
         let mut is_uniform = true;
@@ -267,26 +299,29 @@ fn main() -> anyhow::Result<()> {
     let bin_file = File::open(&args.bin)?;
     let mmap = unsafe { MmapOptions::new().map(&bin_file)? };
     
-    let f32_slice = unsafe {
+    let f64_slice = unsafe {
         std::slice::from_raw_parts(
-            mmap.as_ptr() as *const f32, 
-            mmap.len() / std::mem::size_of::<f32>()
+            mmap.as_ptr() as *const f64, 
+            mmap.len() / std::mem::size_of::<f64>()
         )
     };
     
-    assert_eq!(f32_slice.len(), sequence_length * num_pairs, "Mismatch between VCF and BIN lengths!");
+    assert_eq!(f64_slice.len(), sequence_length * num_pairs, "Mismatch between VCF and BIN lengths!");
 
     // 3. Parallel UPGMA Construction
     println!("Spawning UPGMA tasks across all CPU threads...");
-    let trees: Vec<Tree> = (0..sequence_length)
+    let mut trees: Vec<Tree> = (0..sequence_length)
         .into_par_iter()
         .map(|w| {
-            let dists = &f32_slice[w * num_pairs .. (w + 1) * num_pairs];
+            let dists = &f64_slice[w * num_pairs .. (w + 1) * num_pairs];
             run_upgma(dists, n)
         })
         .collect();
 
-    // 4. Clade Smoothing (Bidirectional Harmonic Averaging)
+    // 3b. Collapse 1-2 SNP topological blips
+    remove_topology_blips(&mut trees, 2);
+
+    // 4. Clade Smoothing (Bidirectional Geometric Averaging)
     println!("Smoothing coalescent times bidirectionally...");
     let forward_times = average_clade_times(&trees);
     

@@ -25,6 +25,65 @@ from popgenml.data import PGTreeSequence
 def build_tree_worker(d_mat, method):
     return distmat_to_tree(d_mat, method=method)[0]
 
+def smooth_log_distances(D_pred, sigma=1.0, radius=2):
+    """
+    Applies a 1D Gaussian filter along the SNP axis in log-distance space
+    (matching liana/lib/src/main.rs:smooth_log_distances).
+    """
+    D = np.asarray(D_pred, dtype=np.float64)
+    L = D.shape[0]
+    if L <= 1 or radius <= 0:
+        return D.copy()
+
+    log_D = np.log(np.maximum(D, 1e-12))
+    offsets = np.arange(-radius, radius + 1)
+    kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
+
+    out = np.empty_like(log_D)
+    for i in range(L):
+        lo = max(0, i - radius)
+        hi = min(L, i + radius + 1)
+        w = kernel[(lo - i + radius) : (hi - i + radius)]
+        w_sum = np.sum(w)
+        out[i] = (w[:, None] * log_D[lo:hi]).sum(axis=0) / w_sum
+
+    return np.exp(out)
+
+def remove_topology_blips(trees, topo_hashes, clades_list, max_blip_len=2):
+    """
+    Absorbs short topological blips (length <= max_blip_len) flanked on both sides
+    by the exact same topology (matching liana/lib/src/main.rs:remove_topology_blips).
+    """
+    n_snps = len(trees)
+    if n_snps <= 2 or max_blip_len <= 0:
+        return trees, topo_hashes, clades_list
+
+    runs = []
+    start = 0
+    for i in range(1, n_snps):
+        if topo_hashes[i] != topo_hashes[start]:
+            runs.append((start, i, topo_hashes[start]))
+            start = i
+    runs.append((start, n_snps, topo_hashes[start]))
+
+    if len(runs) < 3:
+        return trees, topo_hashes, clades_list
+
+    new_trees = list(trees)
+    new_hashes = list(topo_hashes)
+    new_clades = list(clades_list)
+
+    for k in range(1, len(runs) - 1):
+        r_start, r_end, _ = runs[k]
+        if (r_end - r_start) <= max_blip_len and runs[k - 1][2] == runs[k + 1][2]:
+            ref_idx = r_start - 1
+            for idx in range(r_start, r_end):
+                new_trees[idx] = new_trees[ref_idx]
+                new_hashes[idx] = new_hashes[ref_idx]
+                new_clades[idx] = new_clades[ref_idx]
+
+    return new_trees, new_hashes, new_clades
+
 def extract_canonical_clades(tree):
     """
     Extracts canonical topology strings matching liana/lib/src/main.rs:
@@ -32,41 +91,40 @@ def extract_canonical_clades(tree):
     - Internal nodes are represented as `({child0},{child1})` with children sorted lexicographically.
 
     Returns:
-        tuple: (topology_hash, clades_dict) where clades_dict maps canonical clade string -> node time.
+        tuple: (topology_hash, clades_ordered) where clades_ordered is a list of
+        `(clade_str, node_time)` ordered by ascending internal node ID (UPGMA merge order).
     """
     topologies = {}
-    clades = {}
     for u in tree.nodes(order="postorder"):
         if tree.is_sample(u):
             topologies[u] = str(u)
         else:
             children = sorted(topologies[c] for c in tree.children(u))
-            topo = f"({','.join(children)})"
-            topologies[u] = topo
-            clades[topo] = float(tree.time(u))
-    return topologies[tree.root], clades
+            topologies[u] = f"({','.join(children)})"
+
+    internal_nodes = sorted(u for u in tree.nodes() if not tree.is_sample(u))
+    clades_ordered = [(topologies[u], float(tree.time(u))) for u in internal_nodes]
+    return topologies[tree.root], clades_ordered
 
 def apply_smoothed_times(tree, smoothed_times, eps=1e-7):
     """
-    Rebuilds a tskit.Tree with internal node times replaced by `smoothed_times`
-    in ascending internal node ID (UPGMA merge) order, matching main.rs:build_newick.
-    Applies a minimal monotonic nudge only if needed to satisfy tskit's strict parent > child invariant.
+    Rebuilds a tskit.Tree with each internal node assigned its own smoothed coalescent time
+    (in ascending internal node ID / UPGMA merge order, matching main.rs:build_newick).
+    Resolves only parent-child inversions bottom-up via `max(node_time, max(child_heights))`
+    plus a minimal nudge if needed to satisfy tskit's strict parent > child invariant.
     """
     tables = tree.tree_sequence.dump_tables()
-    internal_nodes = sorted([u for u in tree.nodes() if not tree.is_sample(u)])
+    internal_nodes = sorted(u for u in tree.nodes() if not tree.is_sample(u))
 
-    times = np.asarray(smoothed_times, dtype=np.float64).copy()
-    for i in range(len(times)):
-        if i == 0:
-            if times[i] < eps:
-                times[i] = eps
-        else:
-            min_allowed = max(times[i - 1] + eps, np.nextafter(times[i - 1], np.inf))
-            if times[i] < min_allowed:
-                times[i] = min_allowed
-
+    heights = {u: 0.0 for u in tree.nodes() if tree.is_sample(u)}
     for idx, node_id in enumerate(internal_nodes):
-        tables.nodes[node_id] = tables.nodes[node_id].replace(time=float(times[idx]))
+        child_max = max(heights[c] for c in tree.children(node_id))
+        h = max(float(smoothed_times[idx]), child_max)
+        min_allowed = max(child_max + eps, np.nextafter(child_max, np.inf))
+        if h < min_allowed:
+            h = min_allowed
+        heights[node_id] = h
+        tables.nodes[node_id] = tables.nodes[node_id].replace(time=h)
 
     tables.sort()
     return tables.tree_sequence().first(sample_lists=True)
@@ -74,8 +132,8 @@ def apply_smoothed_times(tree, smoothed_times, eps=1e-7):
 def make_coherent(coals, trees, topo_hashes=None):
     """
     Collapses contiguous runs of identical tree topologies (by canonical topology hash,
-    matching main.rs) and rebuilds each region's tree with the smoothed coalescent times
-    at `start_idx`.
+    matching main.rs) and rebuilds each region's tree with the per-node smoothed coalescent
+    times at `start_idx`.
     """
     if topo_hashes is None:
         topo_hashes = [extract_canonical_clades(t)[0] for t in trees]
@@ -115,26 +173,35 @@ def make_coherent(coals, trees, topo_hashes=None):
 def average_clade_times(tree_list):
     """
     Tracks canonical-topology clades across contiguous trees (matching main.rs:average_clade_times),
-    calculates the harmonic average of their coalescent times, and returns sorted smoothed times per tree.
+    calculates the geometric mean of their coalescent times, and writes each clade's smoothed time
+    back to its own internal-node slot (preserving clade-to-node assignment without global sorting).
 
-    Accepts either a sequence of tskit.Tree objects or pre-extracted clade dicts {clade_str: time}.
+    Accepts either a sequence of tskit.Tree objects or pre-extracted ordered clade lists
+    `[(clade_str, time), ...]`.
     """
+    if not tree_list:
+        return []
+
     runs = []
     active_runs = {}
+    num_internal = None
 
     for tree_idx, item in enumerate(tree_list):
-        if isinstance(item, dict):
-            current_clades = item
+        if isinstance(item, list):
+            ordered_clades = item
         else:
-            _, current_clades = extract_canonical_clades(item)
+            _, ordered_clades = extract_canonical_clades(item)
 
-        current_clade_set = set(current_clades.keys())
+        if num_internal is None:
+            num_internal = len(ordered_clades)
+
+        current_clade_set = {c for c, _ in ordered_clades}
         active_clade_set = set(active_runs.keys())
 
         for clade in active_clade_set - current_clade_set:
             del active_runs[clade]
 
-        for clade, time in current_clades.items():
+        for clade_idx, (clade, time) in enumerate(ordered_clades):
             if clade not in active_runs:
                 run_idx = len(runs)
                 runs.append(([], []))
@@ -142,31 +209,62 @@ def average_clade_times(tree_list):
 
             run_idx = active_runs[clade]
             runs[run_idx][0].append(time)
-            runs[run_idx][1].append(tree_idx)
+            runs[run_idx][1].append((tree_idx, clade_idx))
 
-    result = [[] for _ in range(len(tree_list))]
+    result = [[0.0] * num_internal for _ in range(len(tree_list))]
 
-    for times, tree_indices in runs:
-        has_zero = False
-        sum_inv = 0.0
+    for times, locations in runs:
+        has_nonpos = False
+        sum_log = 0.0
         for t in times:
             if t <= 0.0:
-                has_zero = True
+                has_nonpos = True
                 break
-            sum_inv += 1.0 / t
+            sum_log += np.log(t)
 
-        if has_zero or sum_inv == 0.0:
+        if has_nonpos:
             avg_time = 0.0
         else:
-            avg_time = len(times) / sum_inv
+            avg_time = float(np.exp(sum_log / len(times)))
 
-        for tree_idx in tree_indices:
-            result[tree_idx].append(avg_time)
-
-    for res in result:
-        res.sort()
+        for tree_idx, clade_idx in locations:
+            result[tree_idx][clade_idx] = avg_time
 
     return result
+
+def postprocess_distances(D_pred, method="average", num_workers=4):
+    """
+    Full post-processing pipeline matching liana/lib/src/main.rs:
+      1. UPGMA tree construction
+      2. 1-2 SNP topological blip collapsing
+      3. Bidirectional geometric-mean clade time smoothing (preserving node assignment)
+      4. Coherent region collapsing with bottom-up monotonicity
+    """
+    if len(D_pred) == 0:
+        return [], []
+
+    tree_func = partial(build_tree_worker, method=method)
+
+    if num_workers > 1:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            trees_pred = list(executor.map(tree_func, D_pred))
+    else:
+        trees_pred = [tree_func(d) for d in D_pred]
+
+    extracted = [extract_canonical_clades(t) for t in trees_pred]
+    topo_hashes = [h for h, _ in extracted]
+    clades_list = [c for _, c in extracted]
+
+    trees_pred, topo_hashes, clades_list = remove_topology_blips(trees_pred, topo_hashes, clades_list)
+
+    coal_times_pred_fwd = np.array(average_clade_times(clades_list), dtype=np.float64)
+    coal_times_pred_rev = np.array(average_clade_times(clades_list[::-1])[::-1], dtype=np.float64)
+    coal_times_pred_avg = (coal_times_pred_fwd + coal_times_pred_rev) / 2.0
+
+    _, snps_coherent, trees_coherent, _, _ = make_coherent(
+        coal_times_pred_avg, trees_pred, topo_hashes=topo_hashes
+    )
+    return trees_coherent, snps_coherent
 
 
 # =============================================================================
@@ -262,86 +360,75 @@ def liana(
     chunk_start_idx = 0
     total_base_pairs = float(pos_ndarray[-1]) if num_snps > 0 else 0.0
     
-    MIN_SNPS = 1024 
-    trees_pred = []
+    MIN_SNPS = 1024
+    CONTEXT_MARGIN = 256
+    D_pred_chunks = []
     if verbose:
         pbar = tqdm(total=int(total_base_pairs), unit="bp", desc="Processing Windows")
 
-    tree_func = partial(build_tree_worker, method=method)
-
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        with torch.no_grad():
-            while chunk_start_idx < num_snps:
-                target_bp = current_bp + window_size_bp
+    with torch.no_grad():
+        while chunk_start_idx < num_snps:
+            target_bp = current_bp + window_size_bp
+            
+            chunk_end_idx = chunk_start_idx
+            while chunk_end_idx < num_snps and pos_ndarray[chunk_end_idx] < target_bp:
+                chunk_end_idx += 1
                 
-                chunk_end_idx = chunk_start_idx
-                while chunk_end_idx < num_snps and pos_ndarray[chunk_end_idx] < target_bp:
-                    chunk_end_idx += 1
-                    
-                if chunk_end_idx == chunk_start_idx:
-                    current_bp = target_bp
-                    if verbose:
-                        pbar.update(int(window_size_bp))
-                    continue
-                    
-                current_chunk_len = chunk_end_idx - chunk_start_idx
-                
-                # Context Windowing
-                temp_start = chunk_start_idx
-                temp_end = chunk_end_idx
-                
-                if temp_end - temp_start < MIN_SNPS:
-                    needed = MIN_SNPS - (temp_end - temp_start)
-                    temp_start = max(0, temp_start - needed)
-                    if temp_end - temp_start < MIN_SNPS:
-                        needed = MIN_SNPS - (temp_end - temp_start)
-                        temp_end = min(num_snps, temp_end + needed)
-                
-                x_chunk = x_ndarray[:, temp_start:temp_end]
-                pos_chunk = pos_ndarray[temp_start:temp_end]
-                pos_chunk_scaled = (pos_chunk - current_bp) / window_size_bp
-                
-                actual_len = temp_end - temp_start
-                pad_len = 0
-                if actual_len < MIN_SNPS:
-                    pad_len = MIN_SNPS - actual_len
-                    x_chunk = np.pad(x_chunk, ((0,0), (0, pad_len)), mode='constant')
-                    pos_chunk_scaled = np.pad(pos_chunk_scaled, (0, pad_len), mode='edge')
-                
-                D_pred_padded = reg.predict(x_chunk, pos_chunk_scaled)
-                
-                if pad_len > 0:
-                    D_pred_padded = D_pred_padded[:-pad_len, :]
-                    
-                offset = chunk_start_idx - temp_start
-                D_pred = D_pred_padded[offset : offset + current_chunk_len, :]
-                
-                # Parallel Tree Generation
-                chunk_trees = list(executor.map(tree_func, D_pred))
-                trees_pred.extend(chunk_trees)
+            if chunk_end_idx == chunk_start_idx:
+                current_bp = target_bp
                 if verbose:
                     pbar.update(int(window_size_bp))
-                current_bp = target_bp
-                chunk_start_idx = chunk_end_idx
+                continue
+                
+            current_chunk_len = chunk_end_idx - chunk_start_idx
+            
+            # Context Windowing (with flanking margin + MIN_SNPS guarantee)
+            temp_start = max(0, chunk_start_idx - CONTEXT_MARGIN)
+            temp_end = min(num_snps, chunk_end_idx + CONTEXT_MARGIN)
+            
+            if temp_end - temp_start < MIN_SNPS:
+                needed = MIN_SNPS - (temp_end - temp_start)
+                temp_start = max(0, temp_start - needed)
+                if temp_end - temp_start < MIN_SNPS:
+                    needed = MIN_SNPS - (temp_end - temp_start)
+                    temp_end = min(num_snps, temp_end + needed)
+            
+            x_chunk = x_ndarray[:, temp_start:temp_end]
+            pos_chunk = pos_ndarray[temp_start:temp_end]
+            pos_chunk_scaled = (pos_chunk - current_bp) / window_size_bp
+            
+            actual_len = temp_end - temp_start
+            pad_len = 0
+            if actual_len < MIN_SNPS:
+                pad_len = MIN_SNPS - actual_len
+                x_chunk = np.pad(x_chunk, ((0,0), (0, pad_len)), mode='constant')
+                pos_chunk_scaled = np.pad(pos_chunk_scaled, (0, pad_len), mode='edge')
+            
+            D_pred_padded = reg.predict(x_chunk, pos_chunk_scaled)
+            
+            if pad_len > 0:
+                D_pred_padded = D_pred_padded[:-pad_len, :]
+                
+            offset = chunk_start_idx - temp_start
+            D_pred = D_pred_padded[offset : offset + current_chunk_len, :]
+            D_pred_chunks.append(D_pred)
+
+            if verbose:
+                pbar.update(int(window_size_bp))
+            current_bp = target_bp
+            chunk_start_idx = chunk_end_idx
     if verbose:
         pbar.close()
-        logging.info("Extracting coalescent times...")
+        logging.info("Post-processing distances and building marginal trees...")
 
     # 4. Post-processing Pipeline
-    if not trees_pred:
+    if not D_pred_chunks:
         logging.warning("No trees were generated.")
         return PGTreeSequence(trees=[], snps=[])
 
-    extracted = [extract_canonical_clades(t) for t in trees_pred]
-    topo_hashes = [h for h, _ in extracted]
-    clades_list = [c for _, c in extracted]
-
-    coal_times_pred_fwd = np.array(average_clade_times(clades_list), dtype=np.float64)
-    coal_times_pred_rev = np.array(average_clade_times(clades_list[::-1])[::-1], dtype=np.float64)
-    coal_times_pred_avg = (coal_times_pred_fwd + coal_times_pred_rev) / 2.0
-
-    coal_times_pred_final, snps_coherent, trees_coherent, intervals, coal = make_coherent(
-        coal_times_pred_avg, trees_pred, topo_hashes=topo_hashes
+    D_pred_all = np.concatenate(D_pred_chunks, axis=0)
+    trees_coherent, snps_coherent = postprocess_distances(
+        D_pred_all, method=method, num_workers=num_workers
     )
     
     return PGTreeSequence(trees=trees_coherent, snps=snps_coherent)

@@ -178,10 +178,11 @@ def main():
             # ---------------------------------------------------------
             # 4. Redundant Context Windowing & Local Position Scaling
             # ---------------------------------------------------------
-            temp_start = chunk_start_idx
-            temp_end = chunk_end_idx
+            CONTEXT_MARGIN = 256
+            temp_start = max(0, chunk_start_idx - CONTEXT_MARGIN)
+            temp_end = min(num_snps, chunk_end_idx + CONTEXT_MARGIN)
             
-            # Borrow context if the chunk is too small
+            # Borrow additional context if the chunk is still smaller than MIN_SNPS
             if temp_end - temp_start < MIN_SNPS:
                 needed = MIN_SNPS - (temp_end - temp_start)
                 temp_start = max(0, temp_start - needed)
