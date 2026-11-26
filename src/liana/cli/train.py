@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument("--weights", default="None")
     parser.add_argument("--model", default = "conv")
     parser.add_argument("--n", default = 2, type = int)
+    parser.add_argument("--min_haps", default = None, type = int, help = "Min haplotypes per batch for variable-N training (enables variable-N mode)")
+    parser.add_argument("--max_haps", default = None, type = int, help = "Max haplotypes per batch for variable-N training (defaults to 2*n if min_haps is set)")
     parser.add_argument("--factor", default = 2.0, type = float)
     parser.add_argument("--L", default = 2.5e6, type = float)
     
@@ -117,7 +119,8 @@ def get_condensed_indices(indices, n):
 
 class DiskWaveletDataset(IterableDataset):
     def __init__(self, args, file_list, L = 2.5e6, n = None, two_pop = False, dilation = 0., 
-                 use_theory = False, mask_folder = None):
+                 use_theory = False, mask_folder = None, min_haps = None, max_haps = None,
+                 batch_size = None, deterministic_haps = False):
         super().__init__()
         self.args = args
         self.files = file_list # Now a list of .lmdb directory paths
@@ -134,6 +137,10 @@ class DiskWaveletDataset(IterableDataset):
         self.two_pop = two_pop
         
         self.n = n
+        self.min_haps = min_haps
+        self.max_haps = max_haps
+        self.batch_size = batch_size
+        self.deterministic_haps = deterministic_haps
         
         self.masks = []
         if mask_folder is not None and os.path.exists(mask_folder):
@@ -209,6 +216,22 @@ class DiskWaveletDataset(IterableDataset):
             envs[path] = lmdb.open(str(path), readonly=True, lock=False, readahead=False, meminit=False)
 
         # 5. Iterate through the assigned keys
+        use_var_haps = (self.min_haps is not None)
+        batch_X, batch_D = [], []
+
+        def _sample_target_haps():
+            lo = max(2, int(self.min_haps))
+            hi = max(lo, int(self.max_haps))
+            if self.two_pop:
+                lo_even = lo + (lo % 2)
+                hi_even = hi - (hi % 2)
+                if hi_even < lo_even:
+                    return lo_even
+                return int(np.random.choice(np.arange(lo_even, hi_even + 1, 2)))
+            return int(np.random.randint(lo, hi + 1))
+
+        target_haps = _sample_target_haps() if use_var_haps else None
+
         for lmdb_path, key in worker_items:
             try:
                 with envs[lmdb_path].begin() as txn:
@@ -237,7 +260,39 @@ class DiskWaveletDataset(IterableDataset):
                         
             params = data.get('params', {})
             
-            if self.n:
+            if use_var_haps:
+                if x.shape[0] < target_haps:
+                    if len(batch_X) == 0:
+                        target_haps = x.shape[0]
+                    else:
+                        continue
+                if x.shape[0] != target_haps:
+                    if getattr(self, 'two_pop', False):
+                        n1 = target_haps // 2
+                        n2 = target_haps - n1
+                        mid = x.shape[0] // 2
+                        if self.deterministic_haps:
+                            idx1 = np.arange(n1)
+                            idx2 = np.arange(mid, mid + n2)
+                        else:
+                            idx1 = np.random.choice(mid, n1, replace=False)
+                            idx2 = np.random.choice(x.shape[0] - mid, n2, replace=False) + mid
+                        ii = np.sort(np.concatenate([idx1, idx2]))
+                    else:
+                        if self.deterministic_haps:
+                            ii = np.arange(target_haps)
+                        else:
+                            ii = np.sort(np.random.choice(x.shape[0], target_haps, replace=False))
+
+                    ii_ = get_condensed_indices(ii, x.shape[0])
+                    x = x[ii]
+                    y = y[:, ii_]
+
+                    xs = x.sum(0)
+                    valid_cols = np.where((xs != 0) & (xs != x.shape[0]))[0]
+                    x = x[:, valid_cols]
+                    pos = pos[valid_cols]
+            elif self.n:
                 if x.shape[0] != self.n * 2:
                     # randomly downsample the data (choosing some number of pairs)
                     total_pairs = x.shape[0] // 2
@@ -318,7 +373,10 @@ class DiskWaveletDataset(IterableDataset):
             if x.shape[1] < self.args.size:
                 continue
             
-            pos_diff = np.diff(pos, append = np.zeros(1))
+            # Scale pos_diff by Watterson's harmonic number a_n so expected spacing is invariant to N
+            n_haps = x.shape[0]
+            a_n = float(np.sum(1.0 / np.arange(1, n_haps, dtype=np.float64))) if n_haps > 1 else 1.0
+            pos_diff = np.diff(pos, append = np.zeros(1)) * a_n
             
             pos_L = pos * self.L
             starts = ints[:, 0]
@@ -388,7 +446,17 @@ class DiskWaveletDataset(IterableDataset):
                         D_tensor
                     )
 
-                yield X_tensor, D_tensor + self.dilation
+                if use_var_haps:
+                    batch_X.append(X_tensor)
+                    batch_D.append(D_tensor + self.dilation)
+                    if len(batch_X) == self.batch_size:
+                        yield torch.stack(batch_X, dim=0), torch.stack(batch_D, dim=0)
+                        batch_X.clear()
+                        batch_D.clear()
+                        target_haps = _sample_target_haps()
+                        break  # draw next batch with the new target_haps
+                else:
+                    yield X_tensor, D_tensor + self.dilation
             
             
                 
@@ -525,14 +593,21 @@ def main():
         masks = args.masks
     
     # 3. Instantiate the datasets
+    use_var_haps = (args.min_haps is not None) or (args.max_haps is not None)
+    min_haps = (args.min_haps if args.min_haps is not None else 4) if use_var_haps else None
+    max_haps = (args.max_haps if args.max_haps is not None else (args.n * 2)) if use_var_haps else None
+    ds_batch_size = args.batch_size if use_var_haps else None
+    dl_batch_size = None if use_var_haps else args.batch_size
+
     train_dataset = DiskWaveletDataset(args, train_files, n = args.n, two_pop = args.two_pop, dilation = args.dilation, L = args.L, 
-                                       mask_folder = masks)
+                                       mask_folder = masks, min_haps = min_haps, max_haps = max_haps, batch_size = ds_batch_size)
     val_dataset = DiskWaveletDataset(args, val_files, n = args.n, two_pop = args.two_pop, dilation = args.dilation, 
-                                     L = args.L, mask_folder = masks)
+                                     L = args.L, mask_folder = masks, min_haps = max_haps, max_haps = max_haps,
+                                     batch_size = ds_batch_size, deterministic_haps = use_var_haps)
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=dl_batch_size,
         num_workers=args.n_workers,
         prefetch_factor=args.prefetch,
         pin_memory=(device.type == 'cuda'),
@@ -541,7 +616,7 @@ def main():
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=dl_batch_size,
         num_workers=args.n_workers,
         prefetch_factor=args.prefetch,
         pin_memory=(device.type == 'cuda'),

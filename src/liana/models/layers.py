@@ -763,7 +763,7 @@ class ResConvBlock(nn.Module):
     
 class GCNBlock(nn.Module):
     def __init__(self, in_dim=104, n_gcn_layers=2, n_heads=4, K=5, dropout=0.0, norm=nn.LayerNorm, 
-                 add_msg_norm=False, learn_msg_scale=True):
+                 add_msg_norm=False, learn_msg_scale=True, attn_dim=64, attn_heads=4):
         super().__init__()
         
         self.K = K
@@ -778,6 +778,15 @@ class GCNBlock(nn.Module):
                                        share_weights=True, add_msg_norm=add_msg_norm, learn_msg_scale=learn_msg_scale))
 
         self.linear = nn.Linear(in_dim, in_dim)
+
+        # Lightweight global self-attention over the haplotype axis (N) to prevent
+        # kNN clade disconnection when N > K, while remaining permutation-equivariant.
+        self.attn_dim = min(in_dim, attn_dim)
+        self.attn_heads = attn_heads if (self.attn_dim % attn_heads == 0) else 1
+        self.attn_norm = norm((in_dim,))
+        self.attn_qkv = nn.Linear(in_dim, 3 * self.attn_dim, bias=False)
+        self.attn_proj = nn.Linear(self.attn_dim, in_dim)
+        self.attn_scale = nn.Parameter(torch.zeros(1))
     
     def forward(self, x, edge_index=None, random_edges=False):
         n = x.shape[1]
@@ -851,6 +860,17 @@ class GCNBlock(nn.Module):
         x = self.norms[-1](self.gcns[-1](x, edge_index) + x)   
 
         x = x.reshape(-1, n, in_dim)
+
+        # Global self-attention across all N haplotypes (bridges disconnected kNN clades)
+        b_sites = x.shape[0]
+        h_attn = self.attn_norm(x)
+        qkv = self.attn_qkv(h_attn).reshape(
+            b_sites, n, 3, self.attn_heads, self.attn_dim // self.attn_heads
+        ).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(b_sites, n, self.attn_dim)
+        x = x + self.attn_scale * self.attn_proj(attn_out)
         
         return x, edge_index
     
@@ -1173,6 +1193,11 @@ class ConvGCNUNet(nn.Module):
         if self.return_rec_dist:
             # Takes the pooled (gcn_dims[0]) vector and outputs a single scalar prediction
             self.rec_head = nn.Linear(gcn_dims[0], 1)
+
+        # --- Per-site log-scale head (decouples tree height from Lorentz/metric shape) ---
+        self.scale_head = nn.Linear(gcn_dims[0], 1)
+        nn.init.zeros_(self.scale_head.weight)
+        nn.init.zeros_(self.scale_head.bias)
         
     def forward(self, x, use_l2 = False):        
             
@@ -1261,6 +1286,10 @@ class ConvGCNUNet(nn.Module):
             x_embedding = tangent_to_lorentz(tangent_f64.reshape(B * L, N, -1))
             D_raw = PdistLorentz(x_embedding, eps=1e-8)
             D = (torch.log(D_raw) * self.alpha + self.beta).to(torch.float32)
+
+        # Add permutation-invariant per-site log-scale shift (mean-pooled over N)
+        scale_shift = self.scale_head(xv.mean(dim=1))  # Shape: (B * L, 1)
+        D = D + scale_shift
 
         out_dim = x_embedding.shape[-1]
         x_embedding = x_embedding.reshape(B, L, N, out_dim)

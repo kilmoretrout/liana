@@ -51,8 +51,10 @@ class UNetRegressor(object):
             
         windows.append((x.shape[-1] - self.size, x.shape[-1]))
         
-        # get the input: mean centered wavelet coefficients + alignment + diffed positions
-        pos_ = np.diff(pos, append = np.zeros(1))
+        # get the input: mean centered wavelet coefficients + alignment + Watterson-scaled diffed positions
+        n_haps = x.shape[0]
+        a_n = float(np.sum(1.0 / np.arange(1, n_haps, dtype=np.float64))) if n_haps > 1 else 1.0
+        pos_ = np.diff(pos, append = np.zeros(1)) * a_n
         xw = (pgml.compute_cwt(x, self.scales, self.config) - self.mu.reshape(self.mu.shape[0], 1, 1)) / self.std.reshape(self.mu.shape[0], 1, 1)
         
         x_input = np.concatenate([np.expand_dims(x, 0), xw])
